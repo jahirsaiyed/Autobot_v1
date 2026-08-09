@@ -1891,7 +1891,15 @@ int OnInit()
      }
 
    g_dailyBreakerTripped = false;
-   g_maxDrawdownTripped  = IsMaxDrawdownTripped(g_equityPeak, nowEquity, InpMaxDrawdownPercent);
+   if(g_entriesBlockedPersistenceFailsafe)
+      // The in-memory equityPeak above was seeded from current equity, not
+      // the true historical peak (which is unknown - the file was corrupt
+      // or missing). Computing IsMaxDrawdownTripped against a fabricated
+      // peak would always report "not tripped". Stay conservative until a
+      // human clears the fail-safe.
+      g_maxDrawdownTripped = true;
+   else
+      g_maxDrawdownTripped = IsMaxDrawdownTripped(g_equityPeak, nowEquity, InpMaxDrawdownPercent);
 
    ReconstructOpenPositionState();
 
@@ -2047,7 +2055,10 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
 
    double marginRequired;
    if(!OrderCalcMargin(isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, symbol, lots, entryPrice, marginRequired))
+     {
+      LogEvent(TimeToString(TimeCurrent()), symbol, "entry-skipped-margin-calc-failed", entryPrice, lots, stopLoss, currentEquity, "order-calc-margin-failed");
       return;
+     }
    if(marginRequired > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
      {
       LogEvent(TimeToString(TimeCurrent()), symbol, "entry-skipped-margin", entryPrice, lots, stopLoss, currentEquity, "insufficient-margin");
@@ -2092,14 +2103,20 @@ void OnTimer()
       g_dailyStartDayCode   = today;
       g_dailyStartEquity    = currentEquity;
       g_dailyBreakerTripped = false;
-      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak);
+      // Freeze persistence while the fail-safe is active: the in-memory
+      // baseline was fabricated from current equity (true peak unknown),
+      // and writing it to disk would permanently cement a wrong baseline -
+      // even after a human "fixes" the file and restarts. Leave the file
+      // exactly as found until a human clears the fail-safe.
+      if(!g_entriesBlockedPersistenceFailsafe)
+         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak);
      }
 
    g_dailyBreakerTripped = UpdateDailyBreakerState(g_dailyBreakerTripped, g_dailyStartEquity, currentEquity, InpDailyLossPercent);
 
    double previousPeak = g_equityPeak;
    g_equityPeak = UpdateEquityPeak(g_equityPeak, currentEquity);
-   if(g_equityPeak != previousPeak)
+   if(g_equityPeak != previousPeak && !g_entriesBlockedPersistenceFailsafe)
       SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak);
 
    bool wasMaxDDTripped = g_maxDrawdownTripped;
