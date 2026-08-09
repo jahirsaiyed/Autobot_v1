@@ -36,14 +36,20 @@ uncorrelated with the crypto group.
 
 Single EA (`Autobot_v1.mq5`) attached to one chart. On `OnInit()`, state for
 each symbol is rebuilt from live positions/history (no reliance on in-memory
-state surviving a restart). On every `OnTick()`, the EA loops over its symbol
-array and, per symbol: checks trend bias -> checks for a new breakout signal
--> checks risk gates -> manages any existing position's trailing stop ->
-executes/logs as needed.
+state surviving a restart). **Correction from initial draft**: `OnTick()`
+only fires for the chart's own symbol, not for the EA's other tracked
+symbols — so a chart attached to XAUUSD would never reliably process
+BTCUSD/ETHUSD ticks via `OnTick()`. The EA instead uses `OnTimer()` (e.g.
+every 2-5 seconds via `EventSetTimer()`) as its main loop, iterating over the
+symbol array on each timer fire and, per symbol: checks trend bias -> checks
+for a new breakout signal -> checks risk gates -> manages any existing
+position's trailing stop -> executes/logs as needed. `OnTick()` is still
+implemented (required by the platform) but only used for lightweight
+chart-symbol-specific bookkeeping, not the core multi-symbol loop.
 
 ```
 MQL5/Experts/Autobot_v1/
-├── Autobot_v1.mq5          # Main EA: OnInit, OnTick, OnDeinit
+├── Autobot_v1.mq5          # Main EA: OnInit, OnTimer (main loop), OnTick, OnDeinit
 ├── Include/
 │   ├── Config.mqh          # All tunable inputs (risk %, ATR mults, symbol list)
 │   ├── SymbolState.mqh     # Per-symbol state struct
