@@ -1474,7 +1474,12 @@ bool ExecuteMarketOrder(CTrade &trade, string symbol, ENUM_ORDER_TYPE orderType,
 #include "../../Experts/Autobot_v1/Include/TradeExecution.mqh"
 
 #define TEST_MAGIC 999999
-#define TEST_SYMBOL "EURUSD"
+#define TEST_SYMBOL "BTCUSD"
+// BTCUSD chosen over a forex pair (e.g. EURUSD) because forex markets are
+// closed on weekends - a pending-order test would fail with "market closed"
+// whenever run on a Saturday/Sunday. BTCUSD/ETHUSD trade continuously (see
+// spec's weekend-gap discussion), and it's also one of this EA's own three
+// traded symbols, so it's guaranteed to be selected in Market Watch already.
 
 void OnStart()
   {
@@ -1508,8 +1513,12 @@ void OnStart()
      }
 
    double bid = SymbolInfoDouble(TEST_SYMBOL, SYMBOL_BID);
-   double point = SymbolInfoDouble(TEST_SYMBOL, SYMBOL_POINT);
-   double farBelowPrice = NormalizeDouble(bid - 1000 * point, (int)SymbolInfoInteger(TEST_SYMBOL, SYMBOL_DIGITS));
+   // Percentage-based offset, not point-based: a fixed point count means
+   // very different real distances across instruments/price scales (e.g.
+   // 1000 points is negligible on a $60,000+ BTC price but huge on a $2,000
+   // Gold price). 5% below current bid is comfortably far from market for
+   // any of this EA's instruments without relying on point-size assumptions.
+   double farBelowPrice = NormalizeDouble(bid * 0.95, (int)SymbolInfoInteger(TEST_SYMBOL, SYMBOL_DIGITS));
 
    CTrade trade;
    trade.SetExpertMagicNumber(TEST_MAGIC);
