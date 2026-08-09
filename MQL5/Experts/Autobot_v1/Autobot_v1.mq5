@@ -170,6 +170,15 @@ int OnInit()
       // Sticky across restarts unless a human explicitly clears it via
       // InpClearMaxDrawdownBreaker - a restart alone must never clear it.
       g_maxDrawdownTripped = InpClearMaxDrawdownBreaker ? false : loadedMaxDrawdownTripped;
+
+      // Persist immediately whenever this branch changes what's on disk
+      // relative to what was loaded (day-rollover reset, or the override
+      // just cleared a trip) - otherwise the next restart reloads the
+      // stale file and silently undoes the change just made here (e.g.
+      // re-tripping a breaker the operator just cleared, since the file
+      // still says "tripped").
+      if(g_dailyBreakerTripped != loadedDailyBreakerTripped || g_maxDrawdownTripped != loadedMaxDrawdownTripped)
+         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
      }
    else
      {
