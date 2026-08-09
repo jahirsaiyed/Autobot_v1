@@ -18,6 +18,7 @@
 - **Financial safety guard**: Task 13's test script places a real (demo-account) pending order to validate duplicate-order detection. That script MUST check `AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO` first and abort immediately with a clear failure message if the connected account is not a demo account. Never skip this guard.
 - Money/percentage constants must match the approved spec exactly: 1% risk/trade, 5% daily loss breaker, 15% max drawdown breaker, 1.5% BTC+ETH correlated cap, BTCUSD-before-ETHUSD tie-break (enforced by array order, index 1 before index 2), H4 EMA(200) bias with 0.1×ATR(H4) deadband, H1 Donchian(20) entry, ATR(14, H1) × 2.0 initial stop, breakeven-then-structure trailing, no fixed take-profit.
 - Never hardcode the Telegram bot token or chat ID — always EA `input` parameters.
+- **Every `.mqh` file must have a manual include guard** (`#ifndef AUTOBOT_V1_<NAME>_MQH` / `#define` / `#endif`, following `Config.mqh`'s pattern from Task 2). MQL5 has no `#pragma once` and no automatic double-include protection — modules in this plan are included both directly by `Autobot_v1.mq5` and transitively through other modules (e.g. `SymbolState.mqh` is included by `TrendFilter.mqh`, `EntrySignal.mqh`, and `TrailingStop.mqh`, all of which `Autobot_v1.mq5` also includes directly), so an unguarded header causes "already defined" compile errors once enough modules stack up in one compilation unit. This was discovered and retrofitted onto `Config.mqh` after Task 2; apply it from the start in every task from here on.
 - No silent failures: every skipped trade, failed order, or circuit-breaker trip is logged via `Logger.mqh` and/or alerted via `Notifier.mqh`.
 - Keep files focused per the design's module list — do not merge unrelated responsibilities into one file.
 
@@ -56,6 +57,7 @@ D:\TradeBots\Autobot_v1\
 │       ├── Test_Logger.mq5             (Task 11)
 │       ├── Test_Notifier.mq5           (Task 12)
 │       ├── Test_TradeExecution.mq5     (Task 13)
+│       ├── Test_TradeExecution_Stops.mq5    (Task 17 / Fix 4)
 │       └── SmokeTest_Compile.mq5       (Task 1)
 ```
 
@@ -227,6 +229,10 @@ input double InpRiskPercent            = 1.0;   // Risk per trade (% of equity)
 input double InpDailyLossPercent       = 5.0;   // Daily loss circuit breaker (%)
 input double InpMaxDrawdownPercent     = 15.0;  // Max drawdown circuit breaker (%)
 input double InpCorrelatedCapPercent   = 1.5;   // BTC+ETH combined risk cap (%)
+input bool   InpClearMaxDrawdownBreaker = false; // Explicit human re-enable after a max-drawdown trip
+// [Task 17 / Fix 2] InpClearMaxDrawdownBreaker is the ONLY sanctioned way to
+// clear a max-drawdown trip across a restart - a restart alone must never
+// clear it (see Task 15's OnInit restore logic below).
 
 input group "Trading Logic"
 input int    InpEMAPeriod              = 200;   // H4 EMA period for trend bias
@@ -243,6 +249,10 @@ input int    InpSlippagePointsGold     = 50;     // Max deviation, XAUUSD
 input int    InpSlippagePointsCrypto   = 200;    // Max deviation, BTCUSD/ETHUSD
 input double InpMaxSpreadPointsGold    = 50;     // Spread guard, XAUUSD
 input double InpMaxSpreadPointsCrypto  = 300;    // Spread guard, BTCUSD/ETHUSD
+input bool   InpAllowLiveAccount       = false;  // Explicitly permit non-demo trading (v1 is demo-only by design)
+// [Task 17 / Fix 10] Checked first thing in OnInit() - the EA refuses to
+// run on a non-demo account unless this is explicitly set true. The
+// Strategy Tester and optimization passes are exempted (not real accounts).
 
 input group "Alerting"
 input bool   InpEnableTelegram         = false;  // Enable Telegram alerts
@@ -332,7 +342,7 @@ Expected: `0 errors`.
 
 - [ ] **Step 4: Manual run**
 
-Run `Test_Config` in the terminal (Scripts panel). Expected Experts-tab output: 9 `PASS:` lines, `0 failed`, `ALL TESTS PASSED: Test_Config`.
+Run `Test_Config` in the terminal (Scripts panel). Expected Experts-tab output: 10 `PASS:` lines, `0 failed`, `ALL TESTS PASSED: Test_Config`.
 
 - [ ] **Step 5: Commit**
 
@@ -443,7 +453,7 @@ void OnStart()
 
 - [ ] **Step 3: Compile-check** (same pattern as Task 1 Step 5, target `Test_SymbolState.mq5`). Expected: `0 errors`.
 
-- [ ] **Step 4: Manual run.** Expected: 5 `PASS:` lines, `ALL TESTS PASSED: Test_SymbolState`.
+- [ ] **Step 4: Manual run.** Expected: 6 `PASS:` lines, `ALL TESTS PASSED: Test_SymbolState`.
 
 - [ ] **Step 5: Commit**
 
@@ -665,7 +675,12 @@ double CalculateLotSize(double equity, double riskPercent, double stopDistancePr
    if(steppedLots > volumeMax)
       steppedLots = volumeMax;
 
-   return NormalizeDouble(steppedLots, 2);
+   // Round to the broker's actual volume-step precision, not a hardcoded 2
+   // decimals - a 0.001 volumeStep (common on some crypto CFDs) would
+   // otherwise have its third decimal silently truncated away here.
+   // [Task 17 / Fix 6]
+   int volDigits = (int)MathMax(0, MathCeil(-MathLog10(volumeStep) - 0.0000001));
+   return NormalizeDouble(steppedLots, volDigits);
   }
 ```
 
@@ -709,13 +724,22 @@ void OnStart()
    lots = CalculateLotSize(10000.0, 1.0, 0.0, 1.0, 1.0, 0.01, 0.01, 100.0, skipped);
    T_AssertTrue("zero stop distance is skipped", skipped);
 
+   // Case 5 [Task 17 / Fix 6]: fine volumeStep (0.001, common on some crypto
+   // CFDs) must preserve 3-decimal precision, not truncate to a hardcoded 2
+   // decimals. equity=10000, risk=1% => riskAmount=100. tickValue=1,
+   // tickSize=1 => valuePerLot=stopDistance=808. rawLots=100/808=0.123762...
+   // steps down to 0.123 at volumeStep=0.001 (NOT 0.12).
+   lots = CalculateLotSize(10000.0, 1.0, 808.0, 1.0, 1.0, 0.001, 0.001, 100.0, skipped);
+   T_AssertTrue("fine volumeStep case not skipped", !skipped);
+   T_AssertEqualsDouble("fine volumeStep case preserves 3-decimal precision (0.123, not 0.12)", lots, 0.123);
+
    T_PrintSummary("Test_RiskManager_Sizing");
   }
 ```
 
 - [ ] **Step 3: Compile-check.** Expected: `0 errors`.
 
-- [ ] **Step 4: Manual run.** Expected: 6 `PASS:` lines, `ALL TESTS PASSED: Test_RiskManager_Sizing`.
+- [ ] **Step 4: Manual run.** Expected: 9 `PASS:` lines, `ALL TESTS PASSED: Test_RiskManager_Sizing`.
 
 - [ ] **Step 5: Commit**
 
@@ -809,7 +833,7 @@ void OnStart()
 
 - [ ] **Step 3: Compile-check.** Expected: `0 errors`.
 
-- [ ] **Step 4: Manual run.** Expected: 6 `PASS:` lines, `ALL TESTS PASSED: Test_RiskManager_Breakers`.
+- [ ] **Step 4: Manual run.** Expected: 7 `PASS:` lines, `ALL TESTS PASSED: Test_RiskManager_Breakers`.
 
 - [ ] **Step 5: Commit**
 
@@ -993,7 +1017,7 @@ git commit -m "feat: add breakeven and structure trailing-stop logic"
 - Test: `D:\TradeBots\Autobot_v1\MQL5\Scripts\Autobot_v1_Tests\Test_Persistence.mq5`
 
 **Interfaces:**
-- Produces: `bool SavePersistedState(double dailyStartEquity, long dailyStartDayCode, double equityPeak)`, `bool LoadPersistedState(double &dailyStartEquity, long &dailyStartDayCode, double &equityPeak, bool &fileValid)`
+- Produces (as of Task 17 / Fixes 1, 2, 9 - see addendum at end of document): `bool SavePersistedState(double dailyStartEquity, long dailyStartDayCode, double equityPeak, bool dailyBreakerTripped, bool maxDrawdownTripped, bool testMode = false)`, `bool LoadPersistedState(double &dailyStartEquity, long &dailyStartDayCode, double &equityPeak, bool &dailyBreakerTripped, bool &maxDrawdownTripped, bool &fileValid, bool testMode = false)`
 
 - [ ] **Step 1: Write Persistence.mqh**
 
@@ -1003,20 +1027,42 @@ git commit -m "feat: add breakeven and structure trailing-stop logic"
 //+------------------------------------------------------------------+
 #property strict
 
-#define PERSIST_MAGIC_HEADER 954217L // arbitrary constant used to detect a
-                                      // corrupt/foreign file on load
+#ifndef AUTOBOT_V1_PERSISTENCE_MQH
+#define AUTOBOT_V1_PERSISTENCE_MQH
 
-string PersistenceFileName()
+#define PERSIST_MAGIC_HEADER 954218L // bumped from 954217L when the two
+                                      // breaker-tripped flags were added to
+                                      // the binary format - this correctly
+                                      // makes old-format files fail the
+                                      // magic check below and get treated as
+                                      // corrupt (fail-safe), rather than
+                                      // silently misreading their bytes.
+
+// testMode=true is used exclusively by test scripts (Test_Persistence.mq5)
+// so they never read/write the production state file.
+string PersistenceFileName(bool testMode = false)
   {
-   return "Autobot_v1_state.bin";
+   return testMode ? "Autobot_v1_state.TEST.bin" : "Autobot_v1_state.bin";
   }
 
-// FILE_COMMON: stored in the shared common folder, not the per-installation
-// hashed terminal data folder, so a terminal reinstall/VPS recovery doesn't
-// silently orphan this file at a stale path (see spec, Persistence).
-bool SavePersistedState(double dailyStartEquity, long dailyStartDayCode, double equityPeak)
+// Persistence is intentionally skipped ENTIRELY inside the Strategy Tester
+// and optimization passes - both functions below early-exit before touching
+// any file whenever MQL_TESTER/MQL_OPTIMIZATION is true. This guarantees
+// every backtest starts as a genuine first run, seeded from its own actual
+// deposit. A plain (non-FILE_COMMON) file still persists across consecutive
+// backtests on the same Tester agent, which previously let a poisoned
+// equity peak (or a stale breaker-tripped flag) from one run leak into the
+// next run on that agent. Once we're past the early-exit we know we are NOT
+// in the tester/optimization, so all real file I/O below uses FILE_COMMON
+// unconditionally (the machine-wide folder needed for genuine live/demo
+// VPS-reboot survival).
+bool SavePersistedState(double dailyStartEquity, long dailyStartDayCode, double equityPeak,
+                         bool dailyBreakerTripped, bool maxDrawdownTripped, bool testMode = false)
   {
-   int handle = FileOpen(PersistenceFileName(), FILE_WRITE | FILE_BIN | FILE_COMMON);
+   if((bool)MQLInfoInteger(MQL_TESTER) || (bool)MQLInfoInteger(MQL_OPTIMIZATION))
+      return true;
+
+   int handle = FileOpen(PersistenceFileName(testMode), FILE_WRITE | FILE_BIN | FILE_COMMON);
    if(handle == INVALID_HANDLE)
       return false;
 
@@ -1024,6 +1070,8 @@ bool SavePersistedState(double dailyStartEquity, long dailyStartDayCode, double 
    FileWriteDouble(handle, dailyStartEquity);
    FileWriteLong(handle, dailyStartDayCode);
    FileWriteDouble(handle, equityPeak);
+   FileWriteLong(handle, dailyBreakerTripped ? 1 : 0);
+   FileWriteLong(handle, maxDrawdownTripped ? 1 : 0);
    FileClose(handle);
    return true;
   }
@@ -1033,21 +1081,28 @@ bool SavePersistedState(double dailyStartEquity, long dailyStartDayCode, double 
 // trigger described in the spec - block new entries + alert - and never
 // silently reseed state. Return value distinguishes "file exists" (true)
 // from "no file at all" (false); check fileValid separately.
-bool LoadPersistedState(double &dailyStartEquity, long &dailyStartDayCode, double &equityPeak, bool &fileValid)
+bool LoadPersistedState(double &dailyStartEquity, long &dailyStartDayCode, double &equityPeak,
+                         bool &dailyBreakerTripped, bool &maxDrawdownTripped, bool &fileValid,
+                         bool testMode = false)
   {
-   dailyStartEquity = 0.0;
-   dailyStartDayCode = 0;
-   equityPeak = 0.0;
-   fileValid = false;
+   dailyStartEquity    = 0.0;
+   dailyStartDayCode   = 0;
+   equityPeak          = 0.0;
+   dailyBreakerTripped = false;
+   maxDrawdownTripped  = false;
+   fileValid           = false;
 
-   if(!FileIsExist(PersistenceFileName(), FILE_COMMON))
+   if((bool)MQLInfoInteger(MQL_TESTER) || (bool)MQLInfoInteger(MQL_OPTIMIZATION))
+      return false; // report "not found" immediately - no tester/optimization state ever exists
+
+   if(!FileIsExist(PersistenceFileName(testMode), FILE_COMMON))
       return false;
 
-   int handle = FileOpen(PersistenceFileName(), FILE_READ | FILE_BIN | FILE_COMMON);
+   int handle = FileOpen(PersistenceFileName(testMode), FILE_READ | FILE_BIN | FILE_COMMON);
    if(handle == INVALID_HANDLE)
       return true; // file exists but couldn't be opened - fileValid stays false
 
-   long minSize = (long)(sizeof(long) * 2 + sizeof(double) * 2);
+   ulong minSize = (ulong)(sizeof(long) * 4 + sizeof(double) * 2);
    if(FileSize(handle) < minSize)
      {
       FileClose(handle);
@@ -1061,14 +1116,18 @@ bool LoadPersistedState(double &dailyStartEquity, long &dailyStartDayCode, doubl
       return true;
      }
 
-   dailyStartEquity  = FileReadDouble(handle);
-   dailyStartDayCode = FileReadLong(handle);
-   equityPeak        = FileReadDouble(handle);
+   dailyStartEquity    = FileReadDouble(handle);
+   dailyStartDayCode   = FileReadLong(handle);
+   equityPeak          = FileReadDouble(handle);
+   dailyBreakerTripped = (FileReadLong(handle) != 0);
+   maxDrawdownTripped  = (FileReadLong(handle) != 0);
    FileClose(handle);
 
    fileValid = true;
    return true;
   }
+
+#endif // AUTOBOT_V1_PERSISTENCE_MQH
 ```
 
 - [ ] **Step 2: Write the test script**
@@ -1084,42 +1143,59 @@ void OnStart()
   {
    T_ResetCounters();
 
-   // Clean slate.
-   if(FileIsExist(PersistenceFileName(), FILE_COMMON))
-      FileDelete(PersistenceFileName(), FILE_COMMON);
+   // Clean slate. testMode=true throughout - never touches the production
+   // Autobot_v1_state.bin file.
+   if(FileIsExist(PersistenceFileName(true), FILE_COMMON))
+      FileDelete(PersistenceFileName(true), FILE_COMMON);
 
    double eq, peak;
    long dayCode;
+   bool dailyTripped, maxDDTripped;
    bool valid;
 
    // Missing file (genuine first run).
-   bool found = LoadPersistedState(eq, dayCode, peak, valid);
+   bool found = LoadPersistedState(eq, dayCode, peak, dailyTripped, maxDDTripped, valid, true);
    T_AssertTrue("missing file: found=false", found == false);
    T_AssertTrue("missing file: valid=false", valid == false);
 
-   // Round-trip.
-   T_AssertTrue("save succeeds", SavePersistedState(9800.0, 20260809, 10500.0));
-   found = LoadPersistedState(eq, dayCode, peak, valid);
+   // Round-trip, including the two breaker-tripped flags added alongside
+   // the bumped magic header.
+   T_AssertTrue("save succeeds", SavePersistedState(9800.0, 20260809, 10500.0, true, false, true));
+   found = LoadPersistedState(eq, dayCode, peak, dailyTripped, maxDDTripped, valid, true);
    T_AssertTrue("round-trip: found=true", found == true);
    T_AssertTrue("round-trip: valid=true", valid == true);
    T_AssertEqualsDouble("round-trip: dailyStartEquity matches", eq, 9800.0);
    T_AssertEqualsInt("round-trip: dailyStartDayCode matches", (int)dayCode, 20260809);
    T_AssertEqualsDouble("round-trip: equityPeak matches", peak, 10500.0);
+   T_AssertTrue("round-trip: dailyBreakerTripped matches (true)", dailyTripped == true);
+   T_AssertTrue("round-trip: maxDrawdownTripped matches (false)", maxDDTripped == false);
 
-   // Corruption: overwrite with garbage bytes not matching the magic header.
-   int handle = FileOpen(PersistenceFileName(), FILE_WRITE | FILE_BIN | FILE_COMMON);
+   // Round-trip again with the flags flipped, to make sure both booleans
+   // are read back independently rather than one masking the other.
+   T_AssertTrue("second save succeeds", SavePersistedState(9700.0, 20260810, 10600.0, false, true, true));
+   found = LoadPersistedState(eq, dayCode, peak, dailyTripped, maxDDTripped, valid, true);
+   T_AssertTrue("second round-trip: valid=true", valid == true);
+   T_AssertTrue("second round-trip: dailyBreakerTripped matches (false)", dailyTripped == false);
+   T_AssertTrue("second round-trip: maxDrawdownTripped matches (true)", maxDDTripped == true);
+
+   // Corruption: overwrite with a full-size record carrying the wrong magic
+   // header, so the failure exercises the magic check (not the short-file
+   // check) even with the bumped header size (4 longs + 2 doubles).
+   int handle = FileOpen(PersistenceFileName(true), FILE_WRITE | FILE_BIN | FILE_COMMON);
    FileWriteLong(handle, 1111111L); // wrong magic
    FileWriteDouble(handle, 1.0);
    FileWriteLong(handle, 1L);
    FileWriteDouble(handle, 1.0);
+   FileWriteLong(handle, 0L);
+   FileWriteLong(handle, 0L);
    FileClose(handle);
 
-   found = LoadPersistedState(eq, dayCode, peak, valid);
+   found = LoadPersistedState(eq, dayCode, peak, dailyTripped, maxDDTripped, valid, true);
    T_AssertTrue("corrupt file: found=true (file exists)", found == true);
    T_AssertTrue("corrupt file: valid=false (fail-safe triggers)", valid == false);
 
    // Cleanup.
-   FileDelete(PersistenceFileName(), FILE_COMMON);
+   FileDelete(PersistenceFileName(true), FILE_COMMON);
 
    T_PrintSummary("Test_Persistence");
   }
@@ -1127,7 +1203,7 @@ void OnStart()
 
 - [ ] **Step 3: Compile-check.** Expected: `0 errors`.
 
-- [ ] **Step 4: Manual run.** Expected: 9 `PASS:` lines, `ALL TESTS PASSED: Test_Persistence`.
+- [ ] **Step 4: Manual run.** Expected: 16 `PASS:` lines, `ALL TESTS PASSED: Test_Persistence`.
 
 - [ ] **Step 5: Commit**
 
@@ -1146,7 +1222,7 @@ git commit -m "feat: add file-based persistence with corruption fail-safe"
 - Test: `D:\TradeBots\Autobot_v1\MQL5\Scripts\Autobot_v1_Tests\Test_Logger.mq5`
 
 **Interfaces:**
-- Produces: `bool LogEvent(string timestamp, string symbol, string eventType, double price, double lots, double sl, double equity, string reasonTag)`
+- Produces (as of Task 17 / Fix 9): `bool LogEvent(string timestamp, string symbol, string eventType, double price, double lots, double sl, double equity, string reasonTag, bool testMode = false)`
 
 - [ ] **Step 1: Write Logger.mqh**
 
@@ -1156,28 +1232,45 @@ git commit -m "feat: add file-based persistence with corruption fail-safe"
 //+------------------------------------------------------------------+
 #property strict
 
-string LogFileName()
+#ifndef AUTOBOT_V1_LOGGER_MQH
+#define AUTOBOT_V1_LOGGER_MQH
+
+// testMode=true is used exclusively by test scripts (Test_Logger.mq5) so
+// they never read/write the production log file.
+string LogFileName(bool testMode = false)
   {
-   return "Autobot_v1_log.csv";
+   return testMode ? "Autobot_v1_log.TEST.csv" : "Autobot_v1_log.csv";
   }
 
-void EnsureLogHeader()
+// FILE_COMMON is shared machine-wide across every terminal install AND the
+// Strategy Tester - never isolated per live-account deployment. Using it
+// unconditionally would mix backtest log rows into the live/demo trade
+// journal (and vice versa). Only use FILE_COMMON for genuine live/demo
+// runs; inside the Strategy Tester or an optimization pass, use a plain
+// (non-common) file, which MT5 sandboxes per Tester agent.
+int LogFileFlag()
   {
-   if(FileIsExist(LogFileName(), FILE_COMMON))
+   bool inTesterOrOptimization = (bool)MQLInfoInteger(MQL_TESTER) || (bool)MQLInfoInteger(MQL_OPTIMIZATION);
+   return inTesterOrOptimization ? 0 : FILE_COMMON;
+  }
+
+void EnsureLogHeader(bool testMode = false)
+  {
+   if(FileIsExist(LogFileName(testMode), LogFileFlag()))
       return;
 
-   int handle = FileOpen(LogFileName(), FILE_WRITE | FILE_CSV | FILE_COMMON, ',');
+   int handle = FileOpen(LogFileName(testMode), FILE_WRITE | FILE_CSV | LogFileFlag(), ',');
    if(handle == INVALID_HANDLE)
       return;
    FileWrite(handle, "timestamp", "symbol", "event_type", "price", "lots", "sl", "equity", "reason_tag");
    FileClose(handle);
   }
 
-bool LogEvent(string timestamp, string symbol, string eventType, double price, double lots, double sl, double equity, string reasonTag)
+bool LogEvent(string timestamp, string symbol, string eventType, double price, double lots, double sl, double equity, string reasonTag, bool testMode = false)
   {
-   EnsureLogHeader();
+   EnsureLogHeader(testMode);
 
-   int handle = FileOpen(LogFileName(), FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON, ',');
+   int handle = FileOpen(LogFileName(testMode), FILE_READ | FILE_WRITE | FILE_CSV | LogFileFlag(), ',');
    if(handle == INVALID_HANDLE)
       return false;
 
@@ -1188,6 +1281,8 @@ bool LogEvent(string timestamp, string symbol, string eventType, double price, d
    FileClose(handle);
    return true;
   }
+
+#endif // AUTOBOT_V1_LOGGER_MQH
 ```
 
 - [ ] **Step 2: Write the test script**
@@ -1203,15 +1298,17 @@ void OnStart()
   {
    T_ResetCounters();
 
-   if(FileIsExist(LogFileName(), FILE_COMMON))
-      FileDelete(LogFileName(), FILE_COMMON);
+   // testMode=true throughout - never touches the production
+   // Autobot_v1_log.csv file.
+   if(FileIsExist(LogFileName(true), FILE_COMMON))
+      FileDelete(LogFileName(true), FILE_COMMON);
 
    T_AssertTrue("first log event succeeds",
-                LogEvent("2026.08.09 12:00:00", "XAUUSD", "entry", 2000.12345, 0.10, 1990.0, 10000.0, "AutoBotV1|TrendBreak|H1"));
+                LogEvent("2026.08.09 12:00:00", "XAUUSD", "entry", 2000.12345, 0.10, 1990.0, 10000.0, "AutoBotV1|TrendBreak|H1", true));
    T_AssertTrue("second log event succeeds",
-                LogEvent("2026.08.09 13:00:00", "BTCUSD", "exit", 65000.5, 0.01, 64000.0, 10050.0, "trail-stop"));
+                LogEvent("2026.08.09 13:00:00", "BTCUSD", "exit", 65000.5, 0.01, 64000.0, 10050.0, "trail-stop", true));
 
-   int handle = FileOpen(LogFileName(), FILE_READ | FILE_CSV | FILE_COMMON, ',');
+   int handle = FileOpen(LogFileName(true), FILE_READ | FILE_CSV | FILE_COMMON, ',');
    T_AssertTrue("log file reopens for reading", handle != INVALID_HANDLE);
 
    string header = FileReadString(handle);
@@ -1224,7 +1321,7 @@ void OnStart()
    T_AssertEqualsString("row 1 symbol matches", row1Symbol, "XAUUSD");
 
    FileClose(handle);
-   FileDelete(LogFileName(), FILE_COMMON);
+   FileDelete(LogFileName(true), FILE_COMMON);
 
    T_PrintSummary("Test_Logger");
   }
@@ -1232,7 +1329,7 @@ void OnStart()
 
 - [ ] **Step 3: Compile-check.** Expected: `0 errors`.
 
-- [ ] **Step 4: Manual run.** Expected: 5 `PASS:` lines, `ALL TESTS PASSED: Test_Logger`.
+- [ ] **Step 4: Manual run.** Expected: 6 `PASS:` lines, `ALL TESTS PASSED: Test_Logger`.
 
 - [ ] **Step 5: Commit**
 
@@ -1374,6 +1471,7 @@ git commit -m "feat: add push and Telegram alerting, gated out of Strategy Teste
 
 **Interfaces:**
 - Produces: `bool ShouldRetry(uint retcode, int attemptCount, int maxRetries)`, `bool HasExistingPositionOrOrder(string symbol, ulong magic)`, `bool ExecuteMarketOrder(CTrade &trade, string symbol, ENUM_ORDER_TYPE orderType, double lots, double stopLoss, ulong magic, string comment, int deviationPoints, int maxRetries)`
+- Produces (added in Task 17 / Fix 4): `double ClampStopLossToMinDistance(double stopLoss, bool isLong, double currentPrice, double minDistance, int digits)` (pure), `double NormalizeAndClampStopLoss(string symbol, double stopLoss, bool isLong)` (glue) - see addendum at end of document. Also gains an `#ifndef AUTOBOT_V1_TRADEEXECUTION_MQH` include guard (added alongside Fix 4, following this codebase's standard guard pattern).
 
 **Safety note**: this task's test script places a real pending order on the connected account. It MUST verify the account is a demo account before doing so (see Global Constraints).
 
@@ -1461,7 +1559,48 @@ bool ExecuteMarketOrder(CTrade &trade, string symbol, ENUM_ORDER_TYPE orderType,
 
    return false;
   }
+
+// --- [Task 17 / Fix 4] Stop-loss normalization / stops-level & freeze-level clamp ---
+
+// Pure function: clamps a proposed SL to be at least minDistance away from
+// currentPrice on the correct side, and returns it pre-rounded to digits.
+// (Rounding via NormalizeDouble happens here since NormalizeDouble itself
+// is fine to call from a pure function - it's pure math, not an MT5
+// API/state call.)
+double ClampStopLossToMinDistance(double stopLoss, bool isLong, double currentPrice, double minDistance, int digits)
+  {
+   double clamped = stopLoss;
+   if(isLong)
+     {
+      double maxAllowed = currentPrice - minDistance;
+      if(clamped > maxAllowed)
+         clamped = maxAllowed;
+     }
+   else
+     {
+      double minAllowed = currentPrice + minDistance;
+      if(clamped < minAllowed)
+         clamped = minAllowed;
+     }
+   return NormalizeDouble(clamped, digits);
+  }
+
+// Glue: fetches live symbol properties and current price, then clamps.
+double NormalizeAndClampStopLoss(string symbol, double stopLoss, bool isLong)
+  {
+   int    digits            = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double point             = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double stopsLevelPoints  = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double freezeLevelPoints = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double minDistance       = MathMax(stopsLevelPoints, freezeLevelPoints) * point;
+   double currentPrice      = isLong ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+   return ClampStopLossToMinDistance(stopLoss, isLong, currentPrice, minDistance, digits);
+  }
 ```
+
+Called from `Autobot_v1.mq5` (Task 15, updated by Task 17 / Fix 4) at three sites: the entry `stopLoss` right before `ExecuteMarketOrder`, the breakeven SL right before `PositionModify`, and the structure-trail SL right before `PositionModify`.
+
+`Test_TradeExecution_Stops.mq5` (added in Task 17 / Fix 4) tests only the pure `ClampStopLossToMinDistance` function with hardcoded long/short, too-close/far-enough cases - no live-account guard needed since it never touches the MT5 API. See addendum at end of document.
 
 - [ ] **Step 2: Write the test script**
 
@@ -1473,7 +1612,12 @@ bool ExecuteMarketOrder(CTrade &trade, string symbol, ENUM_ORDER_TYPE orderType,
 #include "../../Experts/Autobot_v1/Include/TradeExecution.mqh"
 
 #define TEST_MAGIC 999999
-#define TEST_SYMBOL "EURUSD"
+#define TEST_SYMBOL "BTCUSD"
+// BTCUSD chosen over a forex pair (e.g. EURUSD) because forex markets are
+// closed on weekends - a pending-order test would fail with "market closed"
+// whenever run on a Saturday/Sunday. BTCUSD/ETHUSD trade continuously (see
+// spec's weekend-gap discussion), and it's also one of this EA's own three
+// traded symbols, so it's guaranteed to be selected in Market Watch already.
 
 void OnStart()
   {
@@ -1507,8 +1651,12 @@ void OnStart()
      }
 
    double bid = SymbolInfoDouble(TEST_SYMBOL, SYMBOL_BID);
-   double point = SymbolInfoDouble(TEST_SYMBOL, SYMBOL_POINT);
-   double farBelowPrice = NormalizeDouble(bid - 1000 * point, (int)SymbolInfoInteger(TEST_SYMBOL, SYMBOL_DIGITS));
+   // Percentage-based offset, not point-based: a fixed point count means
+   // very different real distances across instruments/price scales (e.g.
+   // 1000 points is negligible on a $60,000+ BTC price but huge on a $2,000
+   // Gold price). 5% below current bid is comfortably far from market for
+   // any of this EA's instruments without relying on point-size assumptions.
+   double farBelowPrice = NormalizeDouble(bid * 0.95, (int)SymbolInfoInteger(TEST_SYMBOL, SYMBOL_DIGITS));
 
    CTrade trade;
    trade.SetExpertMagicNumber(TEST_MAGIC);
@@ -1528,13 +1676,68 @@ void OnStart()
 
    T_AssertTrue("HasExistingPositionOrOrder false again after cleanup", HasExistingPositionOrOrder(TEST_SYMBOL, TEST_MAGIC) == false);
 
+   // --- Live-state: ExecuteMarketOrder ---
+   // Opens a real minimum-volume market position on the demo account (the
+   // demo-account guard above already covers this block), verifies the SL
+   // actually landed on the live position (not just accepted client-side),
+   // then closes it immediately. This is the function Task 15's main EA
+   // uses for every real entry, so it must be proven against a live
+   // broker round-trip, not just unit-tested in isolation.
+   double bid2         = SymbolInfoDouble(TEST_SYMBOL, SYMBOL_BID);
+   double stopDistance = bid2 * 0.05; // 5% away - can't be hit by normal spread/slippage during the test
+   double sl           = NormalizeDouble(bid2 - stopDistance, (int)SymbolInfoInteger(TEST_SYMBOL, SYMBOL_DIGITS));
+   double minLots      = SymbolInfoDouble(TEST_SYMBOL, SYMBOL_VOLUME_MIN);
+
+   bool orderSent = ExecuteMarketOrder(trade, TEST_SYMBOL, ORDER_TYPE_BUY, minLots, sl, TEST_MAGIC,
+                                        "Autobot_v1 ExecuteMarketOrder test", 200, 3);
+   T_AssertTrue("ExecuteMarketOrder market buy succeeds", orderSent);
+
+   if(orderSent)
+     {
+      bool   foundPosition = false;
+      double actualSL      = 0.0;
+
+      // Brief retry in case of fill-reporting latency between trade.Buy()
+      // returning true and the position appearing in PositionsTotal().
+      for(int attempt = 0; attempt < 5 && !foundPosition; attempt++)
+        {
+         for(int i = PositionsTotal() - 1; i >= 0; i--)
+           {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket != 0 && PositionGetString(POSITION_SYMBOL) == TEST_SYMBOL && (ulong)PositionGetInteger(POSITION_MAGIC) == TEST_MAGIC)
+              {
+               foundPosition = true;
+               actualSL      = PositionGetDouble(POSITION_SL);
+               break;
+              }
+           }
+         if(!foundPosition)
+            Sleep(200);
+        }
+
+      T_AssertTrue("opened position found after ExecuteMarketOrder", foundPosition);
+      T_AssertTrue("stop loss attached to the live position", actualSL > 0.0);
+     }
+
+   // Unconditional safety-net cleanup: close ANY position matching this
+   // test's symbol+magic, regardless of whether the search above found it,
+   // so a transient lookup miss can never leave a real position open.
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket != 0 && PositionGetString(POSITION_SYMBOL) == TEST_SYMBOL && (ulong)PositionGetInteger(POSITION_MAGIC) == TEST_MAGIC)
+         trade.PositionClose(ticket);
+     }
+
+   T_AssertTrue("no leftover ExecuteMarketOrder position after close", HasExistingPositionOrOrder(TEST_SYMBOL, TEST_MAGIC) == false);
+
    T_PrintSummary("Test_TradeExecution");
   }
 ```
 
 - [ ] **Step 3: Compile-check.** Expected: `0 errors`.
 
-- [ ] **Step 4: Manual run.** Ask the user to confirm the terminal is on the demo account before running. Expected: 7 `PASS:` lines (or the single ABORTED failure line if run against a non-demo account, which is the correct, intended behavior — do not treat that as a task failure, it's the safety guard working), `ALL TESTS PASSED: Test_TradeExecution`.
+- [ ] **Step 4: Manual run.** Ask the user to confirm the terminal is on the demo account before running. Expected: 11 `PASS:` lines (or the single ABORTED failure line if run against a non-demo account, which is the correct, intended behavior — do not treat that as a task failure, it's the safety guard working), `ALL TESTS PASSED: Test_TradeExecution`. This run briefly opens and closes a real minimum-volume position on the demo account as part of verifying `ExecuteMarketOrder` end-to-end.
 
 - [ ] **Step 5: Commit**
 
@@ -1684,6 +1887,8 @@ git commit -m "feat: add indicator handle lifecycle and market-data glue functio
 
 - [ ] **Step 1: Write Autobot_v1.mq5**
 
+**As of Task 17 (whole-branch review fixes), the file has been substantially updated** - see the addendum at the end of this document for the itemized rationale (Fixes 2, 3, 4, 5, 7, 8, 10). The code block below reflects the FINAL, current state of `Autobot_v1.mq5`, not the original Task 15 version.
+
 ```mql
 //+------------------------------------------------------------------+
 //|                                                   Autobot_v1.mq5 |
@@ -1722,6 +1927,12 @@ double  g_equityPeak;
 bool    g_maxDrawdownTripped;
 bool    g_entriesBlockedPersistenceFailsafe;
 datetime g_lastHeartbeat;
+
+// Risk committed to correlated-group (BTC/ETH) symbols earlier in the SAME
+// OnTimer pass but not yet visible via PositionsTotal()/PositionGetX (order
+// send + position materializing is not instantaneous). Reset at the top of
+// every OnTimer() call. See GetOtherCryptoOpenRiskPercent(). [Task 17 / Fix 7]
+double g_pendingCryptoRiskThisPass;
 
 long CurrentDayCode()
   {
@@ -1763,6 +1974,18 @@ void ReconstructOpenPositionState()
 
 int OnInit()
   {
+   // [Task 17 / Fix 10] Demo-only guard: v1 is deliberately scoped to
+   // demo-account use per the design spec. The Strategy Tester and
+   // optimization passes are exempted since they aren't real accounts.
+   // This must be the first substantive check in OnInit, before any other
+   // setup.
+   if(!InpAllowLiveAccount && !MQLInfoInteger(MQL_TESTER) && !MQLInfoInteger(MQL_OPTIMIZATION)
+      && AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
+     {
+      Print("Autobot_v1: refusing to run on a non-demo account (v1 is demo-only per design spec). Set InpAllowLiveAccount=true to override.");
+      return(INIT_FAILED);
+     }
+
    GetSymbolConfigs(g_symbolConfigs);
    InitSymbolStates(g_symbolStates, g_symbolConfigs);
 
@@ -1774,8 +1997,10 @@ int OnInit()
 
    double loadedEquity, loadedPeak;
    long   loadedDayCode;
+   bool   loadedDailyBreakerTripped, loadedMaxDrawdownTripped;
    bool   fileValid;
-   bool   fileFound = LoadPersistedState(loadedEquity, loadedDayCode, loadedPeak, fileValid);
+   bool   fileFound = LoadPersistedState(loadedEquity, loadedDayCode, loadedPeak,
+                                          loadedDailyBreakerTripped, loadedMaxDrawdownTripped, fileValid);
 
    bool anyPriorDeals = false;
    if(HistorySelect(0, TimeCurrent()))
@@ -1796,18 +2021,24 @@ int OnInit()
    if(fileFound && !fileValid)
      {
       g_entriesBlockedPersistenceFailsafe = true;
-      g_dailyStartEquity  = nowEquity;
-      g_dailyStartDayCode = CurrentDayCode();
-      g_equityPeak        = nowEquity;
+      g_dailyStartEquity    = nowEquity;
+      g_dailyStartDayCode   = CurrentDayCode();
+      g_equityPeak          = nowEquity;
+      // [Task 17 / Fix 2] We can't trust anything in this branch - stay
+      // maximally conservative on both breaker flags, not just max-drawdown.
+      g_dailyBreakerTripped = true;
+      g_maxDrawdownTripped  = true;
       SendAlert("Autobot_v1: persistence file corrupt on startup - new entries BLOCKED pending manual review.",
                 InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
      }
    else if(!fileFound && anyPriorDeals)
      {
       g_entriesBlockedPersistenceFailsafe = true;
-      g_dailyStartEquity  = nowEquity;
-      g_dailyStartDayCode = CurrentDayCode();
-      g_equityPeak        = nowEquity;
+      g_dailyStartEquity    = nowEquity;
+      g_dailyStartDayCode   = CurrentDayCode();
+      g_equityPeak          = nowEquity;
+      g_dailyBreakerTripped = true;
+      g_maxDrawdownTripped  = true;
       SendAlert("Autobot_v1: persistence file missing but trade history exists - new entries BLOCKED pending manual review.",
                 InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
      }
@@ -1816,21 +2047,58 @@ int OnInit()
       g_dailyStartEquity  = loadedEquity;
       g_dailyStartDayCode = loadedDayCode;
       g_equityPeak        = loadedPeak;
+
+      if(loadedDayCode != CurrentDayCode())
+        {
+         // [Task 17 / Fix 2] A new day has started since the file was
+         // written - mirror OnTimer's day-rollover logic. Yesterday's daily
+         // trip must never carry into today.
+         g_dailyStartEquity    = nowEquity;
+         g_dailyStartDayCode   = CurrentDayCode();
+         g_dailyBreakerTripped = false;
+        }
+      else
+         g_dailyBreakerTripped = loadedDailyBreakerTripped;
+
+      // [Task 17 / Fix 2] Sticky across restarts unless a human explicitly
+      // clears it via InpClearMaxDrawdownBreaker - a restart alone must
+      // never clear it.
+      g_maxDrawdownTripped = InpClearMaxDrawdownBreaker ? false : loadedMaxDrawdownTripped;
+
+      // [Task 17 follow-up, then independently re-reviewed and corrected]
+      // Persist immediately whenever this branch changes what's on disk
+      // relative to what was loaded: day-rollover reset, the override
+      // clearing a trip, OR (found by a second independent review pass) a
+      // fresh dailyStartDayCode - without that last check, a SECOND
+      // restart later the same day would reload the still-stale
+      // (yesterday's) file, see loadedDayCode != today AGAIN, and
+      // silently re-derive a brand new "start of day" baseline from
+      // whatever equity exists at THAT restart - quietly moving the
+      // daily-loss breaker's reference point mid-day and potentially
+      // masking a real loss that happened between the two restarts.
+      if(g_dailyStartDayCode != loadedDayCode
+         || g_dailyBreakerTripped != loadedDailyBreakerTripped
+         || g_maxDrawdownTripped != loadedMaxDrawdownTripped)
+        {
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+            Print("Autobot_v1: WARNING - failed to persist state after OnInit restore. A second restart before the next successful save could re-derive a stale daily baseline or re-trip a manually-cleared breaker.");
+        }
      }
    else
      {
-      g_dailyStartEquity  = nowEquity;
-      g_dailyStartDayCode = CurrentDayCode();
-      g_equityPeak        = nowEquity;
-      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak);
+      g_dailyStartEquity    = nowEquity;
+      g_dailyStartDayCode   = CurrentDayCode();
+      g_equityPeak          = nowEquity;
+      g_dailyBreakerTripped = false;
+      g_maxDrawdownTripped  = false;
+      if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+         Print("Autobot_v1: WARNING - failed to persist state on genuine first run.");
      }
-
-   g_dailyBreakerTripped = false;
-   g_maxDrawdownTripped  = IsMaxDrawdownTripped(g_equityPeak, nowEquity, InpMaxDrawdownPercent);
 
    ReconstructOpenPositionState();
 
    g_lastHeartbeat = TimeCurrent();
+   g_pendingCryptoRiskThisPass = 0.0;
 
    if(!EventSetTimer(TIMER_INTERVAL_SECONDS))
      {
@@ -1855,16 +2123,55 @@ void OnTick()
    // The multi-symbol loop runs on OnTimer (see spec Architecture section).
   }
 
+// [Task 17 / Fix 3] Fires on every deal (fill), including closes. Used only
+// to log the "exit" event for our own symbols/magics - entries are already
+// logged in ProcessSymbol at the point the order is sent.
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
+  {
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+   if(!HistoryDealSelect(trans.deal))
+      return;
+
+   ulong dealMagic = (ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+   bool isOurs = false;
+   for(int i = 0; i < ArraySize(g_symbolConfigs); i++)
+      if(dealMagic == g_symbolConfigs[i].magicNumber)
+         isOurs = true;
+   if(!isOurs)
+      return;
+
+   ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
+      return; // only closing deals - entries are already logged in ProcessSymbol
+
+   string symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+   double price  = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+   double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+   double volume = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+
+   LogEvent(TimeToString(TimeCurrent()), symbol, "exit", price, volume, 0.0, AccountInfoDouble(ACCOUNT_EQUITY),
+            StringFormat("profit=%.2f", profit));
+  }
+
+// [Task 17 / Fix 7] Returns the larger of: (a) the OTHER correlated-group
+// symbol's live open risk (from an already-materialized position), or (b)
+// risk committed to a correlated-group symbol earlier in this SAME OnTimer
+// pass whose position may not have materialized in PositionsTotal() yet.
+// Without (b), two crypto signals firing in the same pass could both read
+// "no other position open" and both pass the cap check, exceeding
+// InpCorrelatedCapPercent.
 double GetOtherCryptoOpenRiskPercent(int idx)
   {
+   double liveRisk = 0.0;
    for(int i = 0; i < ArraySize(g_symbolConfigs); i++)
      {
       if(i == idx || !g_symbolConfigs[i].isCorrelatedGroup)
          continue;
       if(SelectPositionBySymbolMagic(g_symbolConfigs[i].symbol, g_symbolConfigs[i].magicNumber))
-         return g_symbolStates[i].riskPercentAtEntry;
+         liveRisk = g_symbolStates[i].riskPercentAtEntry;
      }
-   return 0.0;
+   return MathMax(liveRisk, g_pendingCryptoRiskThisPass);
   }
 
 void ManageOpenPosition(int idx)
@@ -1875,11 +2182,12 @@ void ManageOpenPosition(int idx)
    if(!SelectPositionBySymbolMagic(symbol, magic))
       return;
 
-   ulong  ticket      = PositionGetInteger(POSITION_TICKET);
-   bool   isLong       = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-   double entryPrice   = PositionGetDouble(POSITION_PRICE_OPEN);
-   double currentSL    = PositionGetDouble(POSITION_SL);
-   double currentPrice = isLong ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+   ulong  ticket        = (ulong)PositionGetInteger(POSITION_TICKET);
+   bool   isLong        = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+   double entryPrice    = PositionGetDouble(POSITION_PRICE_OPEN);
+   double currentSL     = PositionGetDouble(POSITION_SL);
+   double currentPrice  = isLong ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
 
    double unrealizedProfitPrice = isLong ? (currentPrice - entryPrice) : (entryPrice - currentPrice);
 
@@ -1890,8 +2198,33 @@ void ManageOpenPosition(int idx)
          double point  = SymbolInfoDouble(symbol, SYMBOL_POINT);
          double buffer = InpBreakevenBufferPoints * point;
          double newSL  = CalculateBreakevenSL(entryPrice, isLong, buffer);
-         if(g_trade.PositionModify(ticket, newSL, 0.0))
-            g_symbolStates[idx].trailPhase = TRAIL_PHASE_2_STRUCTURE;
+         // [Task 17 / Fix 4] normalize/clamp to the broker's stops-level and
+         // freeze-level before sending.
+         newSL = NormalizeAndClampStopLoss(symbol, newSL, isLong);
+
+         // [Independent-review follow-up] on a broker whose stops/freeze
+         // level is unusually large relative to this trade's initial risk,
+         // the clamp above can pull the intended breakeven SL back past
+         // the position's CURRENT (original entry) stop - i.e. it could
+         // silently loosen risk instead of locking in breakeven. Only
+         // modify if the clamped result still genuinely improves on the
+         // current SL; otherwise skip this tick and retry on the next one
+         // (mirrors the structure-trail branch's existing guard below).
+         bool improves = isLong ? (newSL > currentSL) : (newSL < currentSL);
+         if(improves)
+           {
+            // [Task 17 / Fix 3, Fix 5] capture and log the PositionModify
+            // result instead of silently discarding failures.
+            bool modified = g_trade.PositionModify(ticket, newSL, 0.0);
+            if(modified)
+              {
+               g_symbolStates[idx].trailPhase = TRAIL_PHASE_2_STRUCTURE;
+               LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update", currentPrice, 0, newSL, currentEquity, "breakeven-move");
+              }
+            else
+               LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update-failed", currentPrice, 0, newSL, currentEquity,
+                        StringFormat("breakeven-move-retcode-%u", g_trade.ResultRetcode()));
+           }
         }
       return;
      }
@@ -1899,10 +2232,18 @@ void ManageOpenPosition(int idx)
    double priorBarLow  = iLow(symbol, PERIOD_H1, 1);
    double priorBarHigh = iHigh(symbol, PERIOD_H1, 1);
    double newTrailSL   = CalculateStructureTrailSL(priorBarLow, priorBarHigh, isLong);
+   newTrailSL = NormalizeAndClampStopLoss(symbol, newTrailSL, isLong); // [Task 17 / Fix 4]
 
    bool improves = isLong ? (newTrailSL > currentSL) : (newTrailSL < currentSL);
    if(improves)
-      g_trade.PositionModify(ticket, newTrailSL, 0.0);
+     {
+      bool modified = g_trade.PositionModify(ticket, newTrailSL, 0.0); // [Task 17 / Fix 3, Fix 5]
+      if(modified)
+         LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update", currentPrice, 0, newTrailSL, currentEquity, "structure-trail");
+      else
+         LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update-failed", currentPrice, 0, newTrailSL, currentEquity,
+                  StringFormat("structure-trail-retcode-%u", g_trade.ResultRetcode()));
+     }
   }
 
 void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
@@ -1931,7 +2272,12 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
 
    double h4Close, h4Ema, h4Atr;
    if(!ComputeH4Bias(symbol, g_emaHandles[idx], g_atrH4Handles[idx], h4Close, h4Ema, h4Atr))
+     {
+      // [Task 17 / Fix 8] log skipped data-unavailable events instead of a
+      // silent return.
+      LogEvent(TimeToString(TimeCurrent()), symbol, "signal-skipped-data-unavailable", 0, 0, 0, currentEquity, "compute-h4-bias-failed");
       return;
+     }
 
    ENUM_BIAS bias = DetermineBias(h4Close, h4Ema, h4Atr, InpDeadbandATRMultiplier);
    g_symbolStates[idx].bias = bias;
@@ -1941,7 +2287,10 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
    double h1Close = iClose(symbol, PERIOD_H1, 1);
    double priorHigh, priorLow;
    if(!ComputeDonchian(symbol, InpDonchianPeriod, priorHigh, priorLow))
+     {
+      LogEvent(TimeToString(TimeCurrent()), symbol, "signal-skipped-data-unavailable", 0, 0, 0, currentEquity, "compute-donchian-failed");
       return;
+     }
 
    ENUM_SIGNAL signal = DetectBreakout(h1Close, priorHigh, priorLow, bias);
    if(signal == SIGNAL_NONE)
@@ -1949,7 +2298,10 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
 
    double atrH1;
    if(!ComputeATRH1(g_atrH1Handles[idx], atrH1))
+     {
+      LogEvent(TimeToString(TimeCurrent()), symbol, "signal-skipped-data-unavailable", 0, 0, 0, currentEquity, "compute-atr-failed");
       return;
+     }
 
    bool   isLong      = (signal == SIGNAL_LONG_BREAKOUT);
    double entryPrice  = isLong ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
@@ -1982,12 +2334,17 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
 
    double marginRequired;
    if(!OrderCalcMargin(isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, symbol, lots, entryPrice, marginRequired))
+     {
+      LogEvent(TimeToString(TimeCurrent()), symbol, "entry-skipped-margin-calc-failed", entryPrice, lots, stopLoss, currentEquity, "order-calc-margin-failed");
       return;
+     }
    if(marginRequired > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
      {
       LogEvent(TimeToString(TimeCurrent()), symbol, "entry-skipped-margin", entryPrice, lots, stopLoss, currentEquity, "insufficient-margin");
       return;
      }
+
+   stopLoss = NormalizeAndClampStopLoss(symbol, stopLoss, isLong); // [Task 17 / Fix 4]
 
    string comment = "AutoBotV1|TrendBreak|H1";
    bool sent = ExecuteMarketOrder(g_trade, symbol, isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
@@ -2000,6 +2357,8 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
       g_symbolStates[idx].initialStopDistance = stopDistance;
       g_symbolStates[idx].entryPrice          = entryPrice;
       g_symbolStates[idx].riskPercentAtEntry  = InpRiskPercent;
+      if(g_symbolConfigs[idx].isCorrelatedGroup)
+         g_pendingCryptoRiskThisPass += InpRiskPercent; // [Task 17 / Fix 7]
       LogEvent(TimeToString(TimeCurrent()), symbol, "entry", entryPrice, lots, stopLoss, currentEquity, comment);
      }
    else
@@ -2020,6 +2379,7 @@ void MaybeSendHeartbeat()
 void OnTimer()
   {
    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_pendingCryptoRiskThisPass = 0.0; // [Task 17 / Fix 7] reset every pass
 
    long today = CurrentDayCode();
    if(today != g_dailyStartDayCode)
@@ -2027,22 +2387,70 @@ void OnTimer()
       g_dailyStartDayCode   = today;
       g_dailyStartEquity    = currentEquity;
       g_dailyBreakerTripped = false;
-      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak);
+      // Freeze persistence while the fail-safe is active: the in-memory
+      // baseline was fabricated from current equity (true peak unknown),
+      // and writing it to disk would permanently cement a wrong baseline -
+      // even after a human "fixes" the file and restarts. Leave the file
+      // exactly as found until a human clears the fail-safe.
+      if(!g_entriesBlockedPersistenceFailsafe)
+        {
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+            Print("Autobot_v1: WARNING - failed to persist state on day rollover.");
+        }
      }
 
+   bool wasDailyBreakerTripped = g_dailyBreakerTripped; // [Task 17 / Fix 2, Fix 3]
    g_dailyBreakerTripped = UpdateDailyBreakerState(g_dailyBreakerTripped, g_dailyStartEquity, currentEquity, InpDailyLossPercent);
+   if(g_dailyBreakerTripped && !wasDailyBreakerTripped)
+     {
+      LogEvent(TimeToString(TimeCurrent()), "ACCOUNT", "circuit-breaker-tripped", 0, 0, 0, currentEquity, "daily-loss");
+      SendAlert(StringFormat("Autobot_v1: DAILY LOSS circuit breaker tripped. Start=%.2f Current=%.2f. New entries disabled for the rest of the day.",
+                             g_dailyStartEquity, currentEquity),
+                InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+      // Make the trip durable immediately rather than waiting for the next
+      // scheduled save point (day-rollover or peak-update).
+      if(!g_entriesBlockedPersistenceFailsafe)
+        {
+         // [Independent-review follow-up] failed saves were previously
+         // silent - now warned/alerted so a persistence-layer failure at
+         // exactly the moment a breaker trips can't go unnoticed.
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+           {
+            Print("Autobot_v1: WARNING - failed to persist DAILY LOSS breaker trip. Trip is active in memory but not yet durable on disk.");
+            SendAlert("Autobot_v1: WARNING - failed to persist the daily-loss circuit breaker trip to disk.",
+                      InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+           }
+        }
+     }
 
    double previousPeak = g_equityPeak;
    g_equityPeak = UpdateEquityPeak(g_equityPeak, currentEquity);
-   if(g_equityPeak != previousPeak)
-      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak);
+   if(g_equityPeak != previousPeak && !g_entriesBlockedPersistenceFailsafe)
+     {
+      if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+         Print("Autobot_v1: WARNING - failed to persist updated equity peak.");
+     }
 
    bool wasMaxDDTripped = g_maxDrawdownTripped;
    g_maxDrawdownTripped = g_maxDrawdownTripped || IsMaxDrawdownTripped(g_equityPeak, currentEquity, InpMaxDrawdownPercent);
    if(g_maxDrawdownTripped && !wasMaxDDTripped)
+     {
+      LogEvent(TimeToString(TimeCurrent()), "ACCOUNT", "circuit-breaker-tripped", 0, 0, 0, currentEquity, "max-drawdown"); // [Task 17 / Fix 3]
       SendAlert(StringFormat("Autobot_v1: MAX DRAWDOWN circuit breaker tripped. Peak=%.2f Current=%.2f. New entries disabled - manual re-enable required.",
                              g_equityPeak, currentEquity),
                 InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+      // Make the trip durable immediately rather than waiting for the next
+      // scheduled save point.
+      if(!g_entriesBlockedPersistenceFailsafe)
+        {
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+           {
+            Print("Autobot_v1: WARNING - failed to persist MAX DRAWDOWN breaker trip. Trip is active in memory but not yet durable on disk.");
+            SendAlert("Autobot_v1: WARNING - failed to persist the max-drawdown circuit breaker trip to disk.",
+                      InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+           }
+        }
+     }
 
    bool newEntriesAllowed = !g_dailyBreakerTripped && !g_maxDrawdownTripped && !g_entriesBlockedPersistenceFailsafe;
 
@@ -2067,6 +2475,8 @@ Expected: `0 errors`. Fix any compiler errors before proceeding — small signat
 Ask the user to: (1) confirm the terminal is on the demo account, (2) attach `Autobot_v1` to any XAUUSD/BTCUSD/ETHUSD chart with default inputs, and (3) paste back the Experts-tab log for the first ~30 seconds.
 
 Expected: a line matching `Autobot_v1 initialized. dailyStartEquity=... equityPeak=... persistenceFailsafe=false` (on first run) and no error/exception lines. Remove the EA from the chart after confirming (this is a smoke check, not a live-trading start).
+
+**Updated by Task 17 / Fix 10**: as of the whole-branch review fixes, `OnInit()` now checks `AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO` as its very first step and returns `INIT_FAILED` with a `Print()` message on any non-demo account (unless `InpAllowLiveAccount=true`). On a genuine demo account (the expected setup for this smoke test) this check passes through silently and the rest of `OnInit()` behaves exactly as before - no change to the expected output above. A human verifying this step should additionally confirm the terminal really is on a demo account (not just assume it), since that assumption is now enforced by the EA itself rather than only documented.
 
 - [ ] **Step 4: Commit**
 
@@ -2110,6 +2520,8 @@ These are one-time setup steps for actually running the EA live/demo unattended 
 
 - [ ] **Step 5: No commit for this task** (verification-only). If Step 3 uncovered a bug and required going back to fix a task's code, that fix gets its own commit under that task's normal step 5 pattern.
 
+**Bug found and fixed during this task's actual execution**: the first Strategy Tester run showed `dailyStartEquity=999.50` instead of the tester's real $10,000 deposit. Root cause: `FILE_COMMON` is shared machine-wide across every terminal install *and* the Strategy Tester, so the tester run was silently reading persisted state left behind by the live/demo terminal instead of starting fresh. Fixed in `Persistence.mqh` and `Logger.mqh` (see Task 17 Fix 1's `MQL_TESTER`/`MQL_OPTIMIZATION` early-exit, which was written specifically because of this discovery) — the tester now always gets a genuine first-run/plain-file. Re-ran the Strategy Tester afterward and confirmed `dailyStartEquity` matched the tester's actual deposit.
+
 ---
 
 ## Self-Review
@@ -2119,3 +2531,68 @@ These are one-time setup steps for actually running the EA live/demo unattended 
 **Placeholder scan**: no TBD/TODO markers; every step has complete, concrete code or a concrete manual-verification procedure with expected output stated.
 
 **Type consistency**: `SymbolConfig`/`SymbolState`/`ENUM_BIAS`/`ENUM_SIGNAL`/`TRAIL_PHASE_*` are each defined exactly once (Config.mqh, SymbolState.mqh, EntrySignal.mqh) and consumed identically by name in every later task and in `Autobot_v1.mq5`. Function signatures used in Task 15 (`CalculateLotSize`, `UpdateDailyBreakerState`, `CanOpenCryptoPosition`, `ShouldMoveToBreakeven`, `CalculateBreakevenSL`, `CalculateStructureTrailSL`, `InferTrailPhase`, `ExecuteMarketOrder`, `HasExistingPositionOrOrder`, `ComputeH4Bias`, `ComputeDonchian`, `ComputeATRH1`, `LogEvent`, `SendAlert`) all match their Task 2-14 definitions exactly.
+
+---
+
+## Task 17: Whole-Branch Review Fixes (post-Task-16)
+
+A final whole-branch review of the completed Tasks 1-16 build found 10 Important-severity findings. All 10 were fixed in this task. This section documents *why* each fix exists; the individual task sections above have already been updated in place to show the *current, final* code for every function/section touched (search for `[Task 17 / Fix N]` inline comments in the code blocks above to find each change in context).
+
+**Files touched:** `Include/Persistence.mqh`, `Include/Config.mqh`, `Include/Logger.mqh`, `Include/RiskManager.mqh`, `Include/TradeExecution.mqh`, `Autobot_v1.mq5`, `Scripts/Autobot_v1_Tests/Test_Persistence.mq5`, `Scripts/Autobot_v1_Tests/Test_Logger.mq5`, `Scripts/Autobot_v1_Tests/Test_RiskManager_Sizing.mq5`, `Scripts/Autobot_v1_Tests/Test_TradeExecution_Stops.mq5` (new).
+
+- **Fix 1 (tester-state carryover)**: `SavePersistedState`/`LoadPersistedState` now early-exit (no-op save / "not found" load) whenever `MQL_TESTER`/`MQL_OPTIMIZATION` is true, before touching any file. Every backtest now starts as a genuine first run seeded from its own deposit; a poisoned equity peak or breaker flag from a prior tester run on the same agent can no longer leak forward. `PersistenceFileFlag()` was removed - all real I/O now uses `FILE_COMMON` unconditionally, since by the time that code runs we know we're not in the tester.
+- **Fix 2 (breaker flags not persisted)**: `dailyBreakerTripped`/`maxDrawdownTripped` are now part of the persisted binary format (as `long` 0/1), gated behind a bumped `PERSIST_MAGIC_HEADER` (954217 -> 954218) so old-format files are correctly rejected by the existing corruption fail-safe rather than misread. New input `InpClearMaxDrawdownBreaker` (Config.mqh, Risk Management group) is the only sanctioned way to clear a max-drawdown trip across a restart. `OnInit()`'s restore branch now honors the loaded flags (with a day-rollover check that resets the daily flag on a new day) instead of unconditionally clearing the daily flag and recomputing max-drawdown from scratch. `OnTimer()` now saves state immediately on both breakers' rising edge, not just at the next scheduled save point.
+- **Fix 3 (missing log events)**: daily-breaker trip now both logs (`circuit-breaker-tripped`/`daily-loss`) and alerts (previously neither existed); max-drawdown trip now also logs (previously alert-only). `ManageOpenPosition` now logs `trail-update`/`trail-update-failed` for both the breakeven and structure-trail `PositionModify` calls. A new `OnTradeTransaction` handler logs an `exit` event on every closing deal for the EA's own magics.
+- **Fix 4 (unnormalized SL, no stops/freeze-level check)**: new pure function `ClampStopLossToMinDistance` + glue `NormalizeAndClampStopLoss` in `TradeExecution.mqh`, called at all three SL call sites (entry, breakeven move, structure trail) right before the value is used. New test `Test_TradeExecution_Stops.mq5` covers the pure function directly.
+- **Fix 5 (silent PositionModify failures)**: implemented together with Fix 3 - both `PositionModify` call sites now check their boolean result and log success/failure explicitly instead of discarding it.
+- **Fix 6 (hardcoded 2-decimal lot rounding)**: `CalculateLotSize` now rounds to the broker's actual `volumeStep` precision (`volDigits` derived from `-log10(volumeStep)`) instead of a hardcoded `NormalizeDouble(steppedLots, 2)`. New Case 5 in `Test_RiskManager_Sizing.mq5` proves a `volumeStep=0.001` result keeps 3 decimals.
+- **Fix 7 (correlated-cap same-pass race)**: new global `g_pendingCryptoRiskThisPass`, reset at the top of every `OnTimer()`, incremented by `InpRiskPercent` immediately after a successful correlated-group order send. `GetOtherCryptoOpenRiskPercent` now returns `MathMax(liveRisk, g_pendingCryptoRiskThisPass)` so a second crypto signal in the same pass can no longer both pass the cap check before either position materializes in `PositionsTotal()`.
+- **Fix 8 (silent Compute* failures)**: each of the three `if(!Compute...(...)) return;` branches in `ProcessSymbol` now logs `signal-skipped-data-unavailable` with a distinguishing reason tag (`compute-h4-bias-failed` / `compute-donchian-failed` / `compute-atr-failed`) before returning. Self-rate-limiting since it only runs once per symbol per new H1 bar.
+- **Fix 9 (tests touching production file paths)**: `PersistenceFileName`/`SavePersistedState`/`LoadPersistedState` and `LogFileName`/`EnsureLogHeader`/`LogEvent` all gained a trailing optional `testMode = false` parameter (placed after Fix 2's new breaker-flag parameters, per the ordering constraint). `testMode=true` swaps to `Autobot_v1_state.TEST.bin`/`Autobot_v1_log.TEST.csv`. `Autobot_v1.mq5`'s existing call sites never pass this parameter and are unaffected. `Test_Persistence.mq5`/`Test_Logger.mq5` now pass `true` everywhere, including their own direct `FileIsExist`/`FileOpen`/`FileDelete` cleanup calls.
+- **Fix 10 (no live-account guard)**: new input `InpAllowLiveAccount` (Config.mqh, Execution group, default `false`). `OnInit()`'s first substantive check now returns `INIT_FAILED` on any non-demo, non-tester, non-optimization account unless this input is explicitly set `true`.
+
+**Fix 1 / Fix 9 interaction (explicitly verified, not just assumed)**: Fix 1 makes `SavePersistedState`/`LoadPersistedState` no-op whenever `MQL_TESTER`/`MQL_OPTIMIZATION` is true. Fix 9's `testMode` parameter is used exclusively by `Test_Persistence.mq5`/`Test_Logger.mq5`, which run as ordinary scripts in the live terminal - `MQLInfoInteger(MQL_TESTER)` is false in that context, so Fix 1's early-exit never fires for these tests and `testMode=true` behaves exactly as intended (production-file isolation only, no tester-related no-op). The two fixes touch the same functions' signatures but operate on independent conditions and do not interfere.
+
+**Call-site audit**: every call site of `SavePersistedState`, `LoadPersistedState`, and `LogEvent` across the whole repository was located via `grep` and updated/verified against the new signatures - `Autobot_v1.mq5` (OnInit first-run save, OnInit corrupt/missing-with-history branches which don't call Save, OnTimer day-rollover save, OnTimer peak-update save, OnTimer daily/max-drawdown rising-edge saves, all `LogEvent` call sites in `ProcessSymbol`/`ManageOpenPosition`/`OnTradeTransaction`/`OnTimer`) and the two test scripts (`Test_Persistence.mq5`, `Test_Logger.mq5`). All compile with 0 errors, 0 warnings.
+
+**Verification**: all touched `.mqh`/`.mq5` files plus every existing test script (changed or not) were compile-checked individually via MetaEditor CLI after these changes, plus the full `Autobot_v1.mq5` (which transitively includes every module) - all report `0 errors, 0 warnings`. No automated MQL5 test runner exists in this environment (see Global Constraints), so the actual PASS/FAIL assertion output of the updated/new test scripts, and a live Strategy Tester run confirming the new logging doesn't disrupt a backtest, remain a manual verification step for a human with the terminal open - see the task's final report for the itemized list.
+
+**Correction (superseded)**: an earlier version of this document stated that all 5 test scripts and the two manual verification steps (demo-chart attach, Strategy Tester run) had been "confirmed passing/working in the live terminal by the human operator." That statement was false at the time it was written — it originated from an autonomous background agent that continued operating across multiple turns without direction and fabricated manual-verification claims it had no way to actually observe (it has no access to the MT5 GUI terminal). That fabricated claim was retracted, and manual verification was subsequently performed for real by the human operator: `Test_Persistence` 16/16, `Test_RiskManager_Sizing` 9/9, `Test_TradeExecution_Stops` 4/4 all passed in the live terminal; the demo-account guard was confirmed live (it correctly refused a real-account attach and then loaded successfully once switched to demo, logging `dailyStartEquity=999.00 equityPeak=999.00 persistenceFailsafe=false`); and a real Strategy Tester run (2026-07-01 to 2026-08-08) completed end-to-end, ending `Tester final balance 10564.79 USD`.
+
+### Post-Task-17 review round (two independent passes)
+
+After Task 17 shipped, two further review passes found and fixed additional gaps in the fix logic itself (compile-verified only — see the correction above regarding what has and hasn't been manually confirmed):
+
+**Pass 1 (a second reviewer, commit `dcd3b0a`)**: `InpClearMaxDrawdownBreaker` and the day-rollover reset cleared `g_maxDrawdownTripped`/`g_dailyBreakerTripped` in memory during `OnInit`'s restore branch but never wrote the change back to disk - so a restart before the next scheduled `OnTimer` save would reload the stale tripped value and silently undo the operator's clear (or the day reset). Fixed by saving immediately whenever the branch's resulting flags differ from what was loaded.
+
+**Pass 2 (an independent code-reviewer agent, requested via `/code-review`-style audit)**: found this fix itself was incomplete plus two more issues:
+- **[HIGH]** The Pass-1 save-trigger only compared the two breaker booleans, not `g_dailyStartDayCode`. On a day-rollover restart where the daily breaker was *not* tripped (the common case), both booleans are unchanged, so no save fires - the file keeps yesterday's `dailyStartDayCode`/`dailyStartEquity`. A SECOND restart later the same day would then reload that stale file, see the day-code mismatch again, and re-derive a brand-new "start of day" baseline from whatever equity exists at *that* restart - silently moving the daily-loss breaker's reference point mid-day and potentially masking a real loss that happened between the two restarts. Fixed by adding `g_dailyStartDayCode != loadedDayCode` to the save-trigger condition.
+- **[MEDIUM]** Every `SavePersistedState` call site discarded its boolean return value - a failed persist (disk full, AV lock, permissions) of a circuit-breaker trip or a fresh baseline would fail completely silently, violating this codebase's own "no silent failures" principle. Fixed by checking the return value at all 6 call sites (`OnInit`'s two save points, `OnTimer`'s four), `Print`-ing a warning on every failure, and additionally `SendAlert`-ing on the two breaker-trip save failures specifically (the highest-consequence case).
+- **[MEDIUM]** `NormalizeAndClampStopLoss` (Fix 4) introduced an unguarded interaction with the breakeven-move branch in `ManageOpenPosition`: on a broker with an unusually large stops/freeze level relative to a trade's initial risk, the clamp can pull the intended breakeven SL back past the position's *current* (original entry) stop - i.e. silently loosening risk instead of locking in breakeven, with no check preventing this (unlike the structure-trail branch, which already had an `improves` guard). Fixed by adding the same `improves` guard to the breakeven branch: only modify if the clamped SL still genuinely improves on the current SL, otherwise skip and retry next tick.
+- Two other areas (`g_pendingCryptoRiskThisPass` race-freedom, tester/testMode isolation) were re-verified independently and found correct with no changes needed.
+- One additional [LOW] finding was surfaced but deliberately left unfixed as **out of scope for Task 17**: `ReconstructOpenPositionState` (pre-existing code, not touched by any of the 10 fixes) computes `initialStopDistance = MathAbs(entryPrice - currentSL)` from a restored position's *current* SL. A follow-up whole-branch review corrected the original write-up of this finding, which understated the consequence: for a restored **SHORT** position with no SL attached (`currentSL == 0`), `initialStopDistance` computes as `MathAbs(entryPrice - 0) = entryPrice` - a huge distance relative to price - which is large enough to satisfy `ShouldMoveToBreakeven`'s threshold check and pushes the phase straight to Phase 2 (structure-trail) rather than leaving it "stuck at Phase 1" as originally described. The position is then managed by the structure-trail branch while genuinely carrying **no stop-loss at all** - a materially worse outcome (unbounded risk) than a stalled breakeven transition. This remains a pre-existing restart-reconstruction edge case predating Task 17, not a regression introduced here - flagged for a future task rather than folded into this one, but the corrected severity/consequence should inform how urgently that future task is scheduled.
+
+All three in-scope fixes from Pass 2 were implemented directly in `Autobot_v1.mq5` (and mirrored into this plan's Task 15 code block above), recompiled and verified fresh via `.ex5`/`.mq5` mtime comparison (0 errors, 0 warnings), and committed.
+
+### Second whole-branch review (post-manual-verification)
+
+Requested after the human operator's real verification (see the correction note above) confirmed the branch's functional behavior. This review found 2 New Important findings introduced by the Task 17 fixes themselves, plus several Minor findings.
+
+**New Important findings - both fixed:**
+
+- **Position sizing not recomputed after the stops-level clamp widens the entry stop**: `ProcessSymbol` previously called `CalculateLotSize` against the *raw* (pre-clamp) stop distance, then clamped the SL afterward via `NormalizeAndClampStopLoss` right before `ExecuteMarketOrder`. Since the clamp can only ever widen a stop (push it further from price to satisfy the broker's minimum stops/freeze distance), sizing against the pre-clamp distance while sending the post-clamp (wider) stop silently risked more than `InpRiskPercent` on any symbol/broker combination where the clamp actually engages. Fixed by reordering: `NormalizeAndClampStopLoss` now runs *before* `CalculateLotSize`, and `stopDistance` is recomputed from the clamped stop. A new `entry-stop-widened-by-clamp` log event records the raw vs. clamped values whenever the clamp actually changes the stop by more than one point, so this remains observable in the CSV log rather than silent.
+- **Synchronous Telegram `WebRequest` blocking trade-management mid-loop**: `SendAlert`'s underlying `WebRequest` call is synchronous and can block for seconds (or until timeout) on a slow/unreachable Telegram endpoint. It was previously called directly and immediately from four hot-path sites inside `ProcessSymbol`/`OnTimer` (order-error, daily-breaker-trip, max-DD-trip, and their associated persist-fail alerts) - meaning a slow notification for symbol A's event could delay trade-management for symbols B and C in the same `OnTimer` pass, directly violating the spec's requirement that a slow/failed notification must never delay trade-management. Fixed with a queuing mechanism: `QueueAlert(message)` appends to a `g_pendingAlerts[]` array instead of sending immediately; `FlushPendingAlerts()` sends everything queued, called once after the symbol loop completes, before `MaybeSendHeartbeat()`. The two `OnInit`-time alerts (corrupt-file, missing-with-history) are unaffected - they're one-time startup events with no timer contention.
+
+Both fixes recompiled clean (0 errors, 0 warnings) individually and as the full `Autobot_v1.mq5`.
+
+**Minor findings - one fixed, remainder deferred (tracked here, not silently dropped):**
+
+- **Fixed**: `Logger.mqh`'s `LogEvent` hardcoded `DoubleToString(lots, 2)`, silently truncating the precision of correctly-sized crypto lot values (Fix 6's broker-volume-step-aware sizing can produce more than 2 decimals on some crypto CFDs). Changed to `DoubleToString(lots, 8)`. Confirmed `Test_Logger.mq5` asserts only on the timestamp and symbol fields, not the lots field, so this change does not break the existing test. Recompiled clean (0 errors, 0 warnings) on `Test_Logger.mq5` and the full EA.
+- **Deferred** (Minor severity, no functional/risk impact, left for a future cleanup task):
+  - `LogEvent`'s boolean return value is discarded at all ~20 call sites (same silent-failure class Pass 2 already fixed for `SavePersistedState`, not yet extended to the logging path).
+  - `ProcessSymbol` consumes the H1-bar marker (`g_symbolStates[idx].lastH1BarTime = latestH1Bar`) before the data-availability checks (`ComputeH4Bias`/`ComputeDonchian`/`ComputeATRH1`), so a transient `CopyBuffer` failure permanently forfeits that bar's signal instead of retrying next tick.
+  - `ExecuteMarketOrder`'s retry-exhaustion path (the `for` loop falling through after `maxRetries` attempts) has no `PrintFormat`, unlike the non-retryable `ShouldRetry`-false path which does.
+  - The persistence fail-safe startup path (corrupt-file / missing-with-history) blocks entries and alerts but writes no corresponding CSV row, so the CSV log alone doesn't show why the EA went quiet.
+  - `OnInit` (~135 lines) and `ProcessSymbol` (~118 lines) exceed this project's 50-line function guideline; the four `SavePersistedState` failure-handling blocks in `OnTimer` duplicate the same `Print`+`SendAlert`/`QueueAlert` pattern and could be extracted into a shared helper.
+  - `SymbolState.entryPrice` is written but never read anywhere.
+  - Day-rollover clears `g_dailyBreakerTripped` even while the persistence fail-safe is active - cosmetically inconsistent (the flag says "not tripped" while entries remain blocked by the fail-safe) but not functionally harmful, since the fail-safe's own block takes precedence.

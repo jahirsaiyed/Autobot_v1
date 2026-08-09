@@ -1,0 +1,61 @@
+//+------------------------------------------------------------------+
+//| Logger.mqh - structured CSV event logging                        |
+//+------------------------------------------------------------------+
+#property strict
+
+#ifndef AUTOBOT_V1_LOGGER_MQH
+#define AUTOBOT_V1_LOGGER_MQH
+
+// testMode=true is used exclusively by test scripts (Test_Logger.mq5) so
+// they never read/write the production log file.
+string LogFileName(bool testMode = false)
+  {
+   return testMode ? "Autobot_v1_log.TEST.csv" : "Autobot_v1_log.csv";
+  }
+
+// FILE_COMMON is shared machine-wide across every terminal install AND the
+// Strategy Tester - never isolated per live-account deployment. Using it
+// unconditionally would mix backtest log rows into the live/demo trade
+// journal (and vice versa). Only use FILE_COMMON for genuine live/demo
+// runs; inside the Strategy Tester or an optimization pass, use a plain
+// (non-common) file, which MT5 sandboxes per Tester agent.
+int LogFileFlag()
+  {
+   bool inTesterOrOptimization = (bool)MQLInfoInteger(MQL_TESTER) || (bool)MQLInfoInteger(MQL_OPTIMIZATION);
+   return inTesterOrOptimization ? 0 : FILE_COMMON;
+  }
+
+void EnsureLogHeader(bool testMode = false)
+  {
+   if(FileIsExist(LogFileName(testMode), LogFileFlag()))
+      return;
+
+   int handle = FileOpen(LogFileName(testMode), FILE_WRITE | FILE_CSV | LogFileFlag(), ',');
+   if(handle == INVALID_HANDLE)
+      return;
+   FileWrite(handle, "timestamp", "symbol", "event_type", "price", "lots", "sl", "equity", "reason_tag");
+   FileClose(handle);
+  }
+
+bool LogEvent(string timestamp, string symbol, string eventType, double price, double lots, double sl, double equity, string reasonTag, bool testMode = false)
+  {
+   EnsureLogHeader(testMode);
+
+   int handle = FileOpen(LogFileName(testMode), FILE_READ | FILE_WRITE | FILE_CSV | LogFileFlag(), ',');
+   if(handle == INVALID_HANDLE)
+      return false;
+
+   FileSeek(handle, 0, SEEK_END);
+   // lots logged at 8 decimals, not a hardcoded 2 - CalculateLotSize (see
+   // RiskManager.mqh) sizes to the broker's actual volume step, which can
+   // be finer than 0.01 on some crypto CFDs; truncating the log to 2
+   // decimals here would silently corrupt the backtesting/analysis record
+   // even though the real order was sized correctly.
+   FileWrite(handle, timestamp, symbol, eventType, DoubleToString(price, 5),
+             DoubleToString(lots, 8), DoubleToString(sl, 5),
+             DoubleToString(equity, 2), reasonTag);
+   FileClose(handle);
+   return true;
+  }
+
+#endif // AUTOBOT_V1_LOGGER_MQH
