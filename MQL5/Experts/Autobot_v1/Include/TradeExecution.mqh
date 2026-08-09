@@ -87,4 +87,41 @@ bool ExecuteMarketOrder(CTrade &trade, string symbol, ENUM_ORDER_TYPE orderType,
    return false;
   }
 
+// --- Stop-loss normalization / stops-level & freeze-level clamp --------
+
+// Pure function: clamps a proposed SL to be at least minDistance away from
+// currentPrice on the correct side, and returns it pre-rounded to digits.
+// (Rounding via NormalizeDouble happens here since NormalizeDouble itself
+// is fine to call from a pure function - it's pure math, not an MT5
+// API/state call.)
+double ClampStopLossToMinDistance(double stopLoss, bool isLong, double currentPrice, double minDistance, int digits)
+  {
+   double clamped = stopLoss;
+   if(isLong)
+     {
+      double maxAllowed = currentPrice - minDistance;
+      if(clamped > maxAllowed)
+         clamped = maxAllowed;
+     }
+   else
+     {
+      double minAllowed = currentPrice + minDistance;
+      if(clamped < minAllowed)
+         clamped = minAllowed;
+     }
+   return NormalizeDouble(clamped, digits);
+  }
+
+// Glue: fetches live symbol properties and current price, then clamps.
+double NormalizeAndClampStopLoss(string symbol, double stopLoss, bool isLong)
+  {
+   int    digits           = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double point            = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double stopsLevelPoints = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double freezeLevelPoints = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double minDistance      = MathMax(stopsLevelPoints, freezeLevelPoints) * point;
+   double currentPrice     = isLong ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+   return ClampStopLossToMinDistance(stopLoss, isLong, currentPrice, minDistance, digits);
+  }
+
 #endif // AUTOBOT_V1_TRADEEXECUTION_MQH
