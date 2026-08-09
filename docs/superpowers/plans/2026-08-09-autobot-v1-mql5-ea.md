@@ -1538,13 +1538,56 @@ void OnStart()
 
    T_AssertTrue("HasExistingPositionOrOrder false again after cleanup", HasExistingPositionOrOrder(TEST_SYMBOL, TEST_MAGIC) == false);
 
+   // --- Live-state: ExecuteMarketOrder ---
+   // Opens a real minimum-volume market position on the demo account (the
+   // demo-account guard above already covers this block), verifies the SL
+   // actually landed on the live position (not just accepted client-side),
+   // then closes it immediately. This is the function Task 15's main EA
+   // uses for every real entry, so it must be proven against a live
+   // broker round-trip, not just unit-tested in isolation.
+   double bid2         = SymbolInfoDouble(TEST_SYMBOL, SYMBOL_BID);
+   double stopDistance = bid2 * 0.05; // 5% away - can't be hit by normal spread/slippage during the test
+   double sl           = NormalizeDouble(bid2 - stopDistance, (int)SymbolInfoInteger(TEST_SYMBOL, SYMBOL_DIGITS));
+   double minLots      = SymbolInfoDouble(TEST_SYMBOL, SYMBOL_VOLUME_MIN);
+
+   bool orderSent = ExecuteMarketOrder(trade, TEST_SYMBOL, ORDER_TYPE_BUY, minLots, sl, TEST_MAGIC,
+                                        "Autobot_v1 ExecuteMarketOrder test", 200, 3);
+   T_AssertTrue("ExecuteMarketOrder market buy succeeds", orderSent);
+
+   if(orderSent)
+     {
+      bool   foundPosition = false;
+      double actualSL      = 0.0;
+      ulong  positionTicket = 0;
+
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket != 0 && PositionGetString(POSITION_SYMBOL) == TEST_SYMBOL && (ulong)PositionGetInteger(POSITION_MAGIC) == TEST_MAGIC)
+           {
+            foundPosition  = true;
+            actualSL       = PositionGetDouble(POSITION_SL);
+            positionTicket = ticket;
+            break;
+           }
+        }
+
+      T_AssertTrue("opened position found after ExecuteMarketOrder", foundPosition);
+      T_AssertTrue("stop loss attached to the live position", actualSL > 0.0);
+
+      if(positionTicket != 0)
+         trade.PositionClose(positionTicket);
+     }
+
+   T_AssertTrue("no leftover ExecuteMarketOrder position after close", HasExistingPositionOrOrder(TEST_SYMBOL, TEST_MAGIC) == false);
+
    T_PrintSummary("Test_TradeExecution");
   }
 ```
 
 - [ ] **Step 3: Compile-check.** Expected: `0 errors`.
 
-- [ ] **Step 4: Manual run.** Ask the user to confirm the terminal is on the demo account before running. Expected: 7 `PASS:` lines (or the single ABORTED failure line if run against a non-demo account, which is the correct, intended behavior — do not treat that as a task failure, it's the safety guard working), `ALL TESTS PASSED: Test_TradeExecution`.
+- [ ] **Step 4: Manual run.** Ask the user to confirm the terminal is on the demo account before running. Expected: 11 `PASS:` lines (or the single ABORTED failure line if run against a non-demo account, which is the correct, intended behavior — do not treat that as a task failure, it's the safety guard working), `ALL TESTS PASSED: Test_TradeExecution`. This run briefly opens and closes a real minimum-volume position on the demo account as part of verifying `ExecuteMarketOrder` end-to-end.
 
 - [ ] **Step 5: Commit**
 
