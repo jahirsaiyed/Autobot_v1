@@ -16,6 +16,7 @@ input double InpRiskPercent            = 1.0;   // Risk per trade (% of equity)
 input double InpDailyLossPercent       = 5.0;   // Daily loss circuit breaker (%)
 input double InpMaxDrawdownPercent     = 15.0;  // Max drawdown circuit breaker (%)
 input double InpCorrelatedCapPercent   = 1.5;   // BTC+ETH combined risk cap (%)
+input bool   InpClearMaxDrawdownBreaker = false; // Explicit human re-enable after a max-drawdown trip
 
 input group "Trading Logic"
 input int    InpEMAPeriod              = 200;   // H4 EMA period for trend bias
@@ -32,6 +33,7 @@ input int    InpSlippagePointsGold     = 50;     // Max deviation, XAUUSD
 input int    InpSlippagePointsCrypto   = 200;    // Max deviation, BTCUSD/ETHUSD
 input double InpMaxSpreadPointsGold    = 50;     // Spread guard, XAUUSD
 input double InpMaxSpreadPointsCrypto  = 300;    // Spread guard, BTCUSD/ETHUSD
+input bool   InpAllowLiveAccount       = false;  // Explicitly permit non-demo trading (v1 is demo-only by design)
 
 input group "Alerting"
 input bool   InpEnableTelegram         = false;  // Enable Telegram alerts
