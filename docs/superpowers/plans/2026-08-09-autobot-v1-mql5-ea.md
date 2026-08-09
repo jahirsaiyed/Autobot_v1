@@ -1048,7 +1048,7 @@ bool LoadPersistedState(double &dailyStartEquity, long &dailyStartDayCode, doubl
    if(handle == INVALID_HANDLE)
       return true; // file exists but couldn't be opened - fileValid stays false
 
-   long minSize = (long)(sizeof(long) * 2 + sizeof(double) * 2);
+   ulong minSize = (ulong)(sizeof(long) * 2 + sizeof(double) * 2);
    if(FileSize(handle) < minSize)
      {
       FileClose(handle);
