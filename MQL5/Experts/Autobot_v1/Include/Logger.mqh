@@ -46,8 +46,13 @@ bool LogEvent(string timestamp, string symbol, string eventType, double price, d
       return false;
 
    FileSeek(handle, 0, SEEK_END);
+   // lots logged at 8 decimals, not a hardcoded 2 - CalculateLotSize (see
+   // RiskManager.mqh) sizes to the broker's actual volume step, which can
+   // be finer than 0.01 on some crypto CFDs; truncating the log to 2
+   // decimals here would silently corrupt the backtesting/analysis record
+   // even though the real order was sized correctly.
    FileWrite(handle, timestamp, symbol, eventType, DoubleToString(price, 5),
-             DoubleToString(lots, 2), DoubleToString(sl, 5),
+             DoubleToString(lots, 8), DoubleToString(sl, 5),
              DoubleToString(equity, 2), reasonTag);
    FileClose(handle);
    return true;

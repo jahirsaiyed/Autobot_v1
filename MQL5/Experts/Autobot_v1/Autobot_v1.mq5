@@ -42,6 +42,28 @@ datetime g_lastHeartbeat;
 // every OnTimer() call. See GetOtherCryptoOpenRiskPercent().
 double g_pendingCryptoRiskThisPass;
 
+// Alerts raised mid-pass (order errors, circuit-breaker trips, persist
+// failures) are queued here instead of sent immediately via a blocking,
+// synchronous WebRequest - per spec, a slow/failed notification must never
+// delay trade-management for other symbols in the same OnTimer pass.
+// Flushed once, after the symbol loop. Startup-only alerts in OnInit are
+// NOT queued (no timer contention at that point).
+string g_pendingAlerts[];
+
+void QueueAlert(string message)
+  {
+   int n = ArraySize(g_pendingAlerts);
+   ArrayResize(g_pendingAlerts, n + 1);
+   g_pendingAlerts[n] = message;
+  }
+
+void FlushPendingAlerts()
+  {
+   for(int i = 0; i < ArraySize(g_pendingAlerts); i++)
+      SendAlert(g_pendingAlerts[i], InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+   ArrayResize(g_pendingAlerts, 0);
+  }
+
 long CurrentDayCode()
   {
    MqlDateTime dt;
@@ -403,8 +425,20 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
 
    bool   isLong      = (signal == SIGNAL_LONG_BREAKOUT);
    double entryPrice  = isLong ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
-   double stopDistance = InpATRStopMultiplier * atrH1;
-   double stopLoss     = isLong ? (entryPrice - stopDistance) : (entryPrice + stopDistance);
+   double rawStopDistance = InpATRStopMultiplier * atrH1;
+   double rawStopLoss     = isLong ? (entryPrice - rawStopDistance) : (entryPrice + rawStopDistance);
+
+   // Clamp BEFORE sizing, not after: the clamp can only ever widen the stop
+   // (push it further from price to satisfy the broker's minimum stops/
+   // freeze distance), never narrow it. Sizing against the pre-clamp
+   // distance while sending the post-clamp (wider) stop would silently
+   // risk more than InpRiskPercent - so recompute the actual distance from
+   // the clamped stop and size against that instead.
+   double stopLoss     = NormalizeAndClampStopLoss(symbol, rawStopLoss, isLong);
+   double stopDistance = MathAbs(entryPrice - stopLoss);
+   if(MathAbs(stopDistance - rawStopDistance) > SymbolInfoDouble(symbol, SYMBOL_POINT))
+      LogEvent(TimeToString(TimeCurrent()), symbol, "entry-stop-widened-by-clamp", entryPrice, 0, stopLoss, currentEquity,
+               StringFormat("raw=%.5f clamped=%.5f", rawStopLoss, stopLoss));
 
    if(g_symbolConfigs[idx].isCorrelatedGroup)
      {
@@ -442,8 +476,6 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
       return;
      }
 
-   stopLoss = NormalizeAndClampStopLoss(symbol, stopLoss, isLong);
-
    string comment = "AutoBotV1|TrendBreak|H1";
    bool sent = ExecuteMarketOrder(g_trade, symbol, isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
                                    lots, stopLoss, magic, comment,
@@ -462,7 +494,7 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
    else
      {
       LogEvent(TimeToString(TimeCurrent()), symbol, "order-error", entryPrice, lots, stopLoss, currentEquity, "execute-failed");
-      SendAlert(StringFormat("Autobot_v1: order execution failed on %s", symbol), InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+      QueueAlert(StringFormat("Autobot_v1: order execution failed on %s", symbol));
      }
   }
 
@@ -502,9 +534,8 @@ void OnTimer()
    if(g_dailyBreakerTripped && !wasDailyBreakerTripped)
      {
       LogEvent(TimeToString(TimeCurrent()), "ACCOUNT", "circuit-breaker-tripped", 0, 0, 0, currentEquity, "daily-loss");
-      SendAlert(StringFormat("Autobot_v1: DAILY LOSS circuit breaker tripped. Start=%.2f Current=%.2f. New entries disabled for the rest of the day.",
-                             g_dailyStartEquity, currentEquity),
-                InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+      QueueAlert(StringFormat("Autobot_v1: DAILY LOSS circuit breaker tripped. Start=%.2f Current=%.2f. New entries disabled for the rest of the day.",
+                             g_dailyStartEquity, currentEquity));
       // Make the trip durable immediately rather than waiting for the next
       // scheduled save point (day-rollover or peak-update).
       if(!g_entriesBlockedPersistenceFailsafe)
@@ -512,8 +543,7 @@ void OnTimer()
          if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
            {
             Print("Autobot_v1: WARNING - failed to persist DAILY LOSS breaker trip. Trip is active in memory but not yet durable on disk.");
-            SendAlert("Autobot_v1: WARNING - failed to persist the daily-loss circuit breaker trip to disk.",
-                      InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+            QueueAlert("Autobot_v1: WARNING - failed to persist the daily-loss circuit breaker trip to disk.");
            }
         }
      }
@@ -531,9 +561,8 @@ void OnTimer()
    if(g_maxDrawdownTripped && !wasMaxDDTripped)
      {
       LogEvent(TimeToString(TimeCurrent()), "ACCOUNT", "circuit-breaker-tripped", 0, 0, 0, currentEquity, "max-drawdown");
-      SendAlert(StringFormat("Autobot_v1: MAX DRAWDOWN circuit breaker tripped. Peak=%.2f Current=%.2f. New entries disabled - manual re-enable required.",
-                             g_equityPeak, currentEquity),
-                InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+      QueueAlert(StringFormat("Autobot_v1: MAX DRAWDOWN circuit breaker tripped. Peak=%.2f Current=%.2f. New entries disabled - manual re-enable required.",
+                             g_equityPeak, currentEquity));
       // Make the trip durable immediately rather than waiting for the next
       // scheduled save point.
       if(!g_entriesBlockedPersistenceFailsafe)
@@ -541,8 +570,7 @@ void OnTimer()
          if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
            {
             Print("Autobot_v1: WARNING - failed to persist MAX DRAWDOWN breaker trip. Trip is active in memory but not yet durable on disk.");
-            SendAlert("Autobot_v1: WARNING - failed to persist the max-drawdown circuit breaker trip to disk.",
-                      InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+            QueueAlert("Autobot_v1: WARNING - failed to persist the max-drawdown circuit breaker trip to disk.");
            }
         }
      }
@@ -551,6 +579,12 @@ void OnTimer()
 
    for(int i = 0; i < ArraySize(g_symbolConfigs); i++)
       ProcessSymbol(i, newEntriesAllowed, currentEquity);
+
+   // Flush any alerts queued during this pass (order errors, breaker trips,
+   // persist failures) now that all symbols have been managed - a slow or
+   // failed WebRequest here can no longer delay trade-management for any
+   // symbol in this pass, per the spec's explicit requirement.
+   FlushPendingAlerts();
 
    MaybeSendHeartbeat();
   }
