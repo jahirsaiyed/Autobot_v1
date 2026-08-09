@@ -2065,14 +2065,24 @@ int OnInit()
       // never clear it.
       g_maxDrawdownTripped = InpClearMaxDrawdownBreaker ? false : loadedMaxDrawdownTripped;
 
-      // [Task 17 follow-up] Persist immediately whenever this branch
-      // changes what's on disk relative to what was loaded (day-rollover
-      // reset, or the override just cleared a trip) - otherwise the next
-      // restart reloads the stale file and silently undoes the change
-      // just made here (e.g. re-tripping a breaker the operator just
-      // cleared, since the file still says "tripped").
-      if(g_dailyBreakerTripped != loadedDailyBreakerTripped || g_maxDrawdownTripped != loadedMaxDrawdownTripped)
-         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+      // [Task 17 follow-up, then independently re-reviewed and corrected]
+      // Persist immediately whenever this branch changes what's on disk
+      // relative to what was loaded: day-rollover reset, the override
+      // clearing a trip, OR (found by a second independent review pass) a
+      // fresh dailyStartDayCode - without that last check, a SECOND
+      // restart later the same day would reload the still-stale
+      // (yesterday's) file, see loadedDayCode != today AGAIN, and
+      // silently re-derive a brand new "start of day" baseline from
+      // whatever equity exists at THAT restart - quietly moving the
+      // daily-loss breaker's reference point mid-day and potentially
+      // masking a real loss that happened between the two restarts.
+      if(g_dailyStartDayCode != loadedDayCode
+         || g_dailyBreakerTripped != loadedDailyBreakerTripped
+         || g_maxDrawdownTripped != loadedMaxDrawdownTripped)
+        {
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+            Print("Autobot_v1: WARNING - failed to persist state after OnInit restore. A second restart before the next successful save could re-derive a stale daily baseline or re-trip a manually-cleared breaker.");
+        }
      }
    else
      {
@@ -2081,7 +2091,8 @@ int OnInit()
       g_equityPeak          = nowEquity;
       g_dailyBreakerTripped = false;
       g_maxDrawdownTripped  = false;
-      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+      if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+         Print("Autobot_v1: WARNING - failed to persist state on genuine first run.");
      }
 
    ReconstructOpenPositionState();
@@ -2191,17 +2202,29 @@ void ManageOpenPosition(int idx)
          // freeze-level before sending.
          newSL = NormalizeAndClampStopLoss(symbol, newSL, isLong);
 
-         // [Task 17 / Fix 3, Fix 5] capture and log the PositionModify
-         // result instead of silently discarding failures.
-         bool modified = g_trade.PositionModify(ticket, newSL, 0.0);
-         if(modified)
+         // [Independent-review follow-up] on a broker whose stops/freeze
+         // level is unusually large relative to this trade's initial risk,
+         // the clamp above can pull the intended breakeven SL back past
+         // the position's CURRENT (original entry) stop - i.e. it could
+         // silently loosen risk instead of locking in breakeven. Only
+         // modify if the clamped result still genuinely improves on the
+         // current SL; otherwise skip this tick and retry on the next one
+         // (mirrors the structure-trail branch's existing guard below).
+         bool improves = isLong ? (newSL > currentSL) : (newSL < currentSL);
+         if(improves)
            {
-            g_symbolStates[idx].trailPhase = TRAIL_PHASE_2_STRUCTURE;
-            LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update", currentPrice, 0, newSL, currentEquity, "breakeven-move");
+            // [Task 17 / Fix 3, Fix 5] capture and log the PositionModify
+            // result instead of silently discarding failures.
+            bool modified = g_trade.PositionModify(ticket, newSL, 0.0);
+            if(modified)
+              {
+               g_symbolStates[idx].trailPhase = TRAIL_PHASE_2_STRUCTURE;
+               LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update", currentPrice, 0, newSL, currentEquity, "breakeven-move");
+              }
+            else
+               LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update-failed", currentPrice, 0, newSL, currentEquity,
+                        StringFormat("breakeven-move-retcode-%u", g_trade.ResultRetcode()));
            }
-         else
-            LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update-failed", currentPrice, 0, newSL, currentEquity,
-                     StringFormat("breakeven-move-retcode-%u", g_trade.ResultRetcode()));
         }
       return;
      }
@@ -2370,7 +2393,10 @@ void OnTimer()
       // even after a human "fixes" the file and restarts. Leave the file
       // exactly as found until a human clears the fail-safe.
       if(!g_entriesBlockedPersistenceFailsafe)
-         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+        {
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+            Print("Autobot_v1: WARNING - failed to persist state on day rollover.");
+        }
      }
 
    bool wasDailyBreakerTripped = g_dailyBreakerTripped; // [Task 17 / Fix 2, Fix 3]
@@ -2384,13 +2410,26 @@ void OnTimer()
       // Make the trip durable immediately rather than waiting for the next
       // scheduled save point (day-rollover or peak-update).
       if(!g_entriesBlockedPersistenceFailsafe)
-         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+        {
+         // [Independent-review follow-up] failed saves were previously
+         // silent - now warned/alerted so a persistence-layer failure at
+         // exactly the moment a breaker trips can't go unnoticed.
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+           {
+            Print("Autobot_v1: WARNING - failed to persist DAILY LOSS breaker trip. Trip is active in memory but not yet durable on disk.");
+            SendAlert("Autobot_v1: WARNING - failed to persist the daily-loss circuit breaker trip to disk.",
+                      InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+           }
+        }
      }
 
    double previousPeak = g_equityPeak;
    g_equityPeak = UpdateEquityPeak(g_equityPeak, currentEquity);
    if(g_equityPeak != previousPeak && !g_entriesBlockedPersistenceFailsafe)
-      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+     {
+      if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+         Print("Autobot_v1: WARNING - failed to persist updated equity peak.");
+     }
 
    bool wasMaxDDTripped = g_maxDrawdownTripped;
    g_maxDrawdownTripped = g_maxDrawdownTripped || IsMaxDrawdownTripped(g_equityPeak, currentEquity, InpMaxDrawdownPercent);
@@ -2403,7 +2442,14 @@ void OnTimer()
       // Make the trip durable immediately rather than waiting for the next
       // scheduled save point.
       if(!g_entriesBlockedPersistenceFailsafe)
-         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+        {
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+           {
+            Print("Autobot_v1: WARNING - failed to persist MAX DRAWDOWN breaker trip. Trip is active in memory but not yet durable on disk.");
+            SendAlert("Autobot_v1: WARNING - failed to persist the max-drawdown circuit breaker trip to disk.",
+                      InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+           }
+        }
      }
 
    bool newEntriesAllowed = !g_dailyBreakerTripped && !g_maxDrawdownTripped && !g_entriesBlockedPersistenceFailsafe;
@@ -2508,3 +2554,20 @@ A final whole-branch review of the completed Tasks 1-16 build found 10 Important
 **Call-site audit**: every call site of `SavePersistedState`, `LoadPersistedState`, and `LogEvent` across the whole repository was located via `grep` and updated/verified against the new signatures - `Autobot_v1.mq5` (OnInit first-run save, OnInit corrupt/missing-with-history branches which don't call Save, OnTimer day-rollover save, OnTimer peak-update save, OnTimer daily/max-drawdown rising-edge saves, all `LogEvent` call sites in `ProcessSymbol`/`ManageOpenPosition`/`OnTradeTransaction`/`OnTimer`) and the two test scripts (`Test_Persistence.mq5`, `Test_Logger.mq5`). All compile with 0 errors, 0 warnings.
 
 **Verification**: all touched `.mqh`/`.mq5` files plus every existing test script (changed or not) were compile-checked individually via MetaEditor CLI after these changes, plus the full `Autobot_v1.mq5` (which transitively includes every module) - all report `0 errors, 0 warnings`. No automated MQL5 test runner exists in this environment (see Global Constraints), so the actual PASS/FAIL assertion output of the updated/new test scripts, and a live Strategy Tester run confirming the new logging doesn't disrupt a backtest, remain a manual verification step for a human with the terminal open - see the task's final report for the itemized list.
+
+**All 5 relevant test scripts and both manual verification steps (demo-chart attach, Strategy Tester run) were subsequently confirmed passing/working in the live terminal by the human operator.**
+
+### Post-Task-17 review round (two independent passes)
+
+After Task 17 shipped and was verified, two further review passes found and fixed additional gaps in the fix logic itself:
+
+**Pass 1 (a second reviewer, commit `dcd3b0a`)**: `InpClearMaxDrawdownBreaker` and the day-rollover reset cleared `g_maxDrawdownTripped`/`g_dailyBreakerTripped` in memory during `OnInit`'s restore branch but never wrote the change back to disk - so a restart before the next scheduled `OnTimer` save would reload the stale tripped value and silently undo the operator's clear (or the day reset). Fixed by saving immediately whenever the branch's resulting flags differ from what was loaded.
+
+**Pass 2 (an independent code-reviewer agent, requested via `/code-review`-style audit)**: found this fix itself was incomplete plus two more issues:
+- **[HIGH]** The Pass-1 save-trigger only compared the two breaker booleans, not `g_dailyStartDayCode`. On a day-rollover restart where the daily breaker was *not* tripped (the common case), both booleans are unchanged, so no save fires - the file keeps yesterday's `dailyStartDayCode`/`dailyStartEquity`. A SECOND restart later the same day would then reload that stale file, see the day-code mismatch again, and re-derive a brand-new "start of day" baseline from whatever equity exists at *that* restart - silently moving the daily-loss breaker's reference point mid-day and potentially masking a real loss that happened between the two restarts. Fixed by adding `g_dailyStartDayCode != loadedDayCode` to the save-trigger condition.
+- **[MEDIUM]** Every `SavePersistedState` call site discarded its boolean return value - a failed persist (disk full, AV lock, permissions) of a circuit-breaker trip or a fresh baseline would fail completely silently, violating this codebase's own "no silent failures" principle. Fixed by checking the return value at all 6 call sites (`OnInit`'s two save points, `OnTimer`'s four), `Print`-ing a warning on every failure, and additionally `SendAlert`-ing on the two breaker-trip save failures specifically (the highest-consequence case).
+- **[MEDIUM]** `NormalizeAndClampStopLoss` (Fix 4) introduced an unguarded interaction with the breakeven-move branch in `ManageOpenPosition`: on a broker with an unusually large stops/freeze level relative to a trade's initial risk, the clamp can pull the intended breakeven SL back past the position's *current* (original entry) stop - i.e. silently loosening risk instead of locking in breakeven, with no check preventing this (unlike the structure-trail branch, which already had an `improves` guard). Fixed by adding the same `improves` guard to the breakeven branch: only modify if the clamped SL still genuinely improves on the current SL, otherwise skip and retry next tick.
+- Two other areas (`g_pendingCryptoRiskThisPass` race-freedom, tester/testMode isolation) were re-verified independently and found correct with no changes needed.
+- One additional [LOW] finding was surfaced but deliberately left unfixed as **out of scope for Task 17**: `ReconstructOpenPositionState` (pre-existing code, not touched by any of the 10 fixes) computes `initialStopDistance = MathAbs(entryPrice - currentSL)`; if a restored position somehow has no SL attached (`currentSL == 0`), this produces a huge `initialStopDistance` that can never trigger `ShouldMoveToBreakeven`, leaving the position's phase stuck at Phase 1 indefinitely. This is a pre-existing restart-reconstruction edge case predating Task 17, not a regression introduced here - flagged for a future task rather than folded into this one.
+
+All three in-scope fixes from Pass 2 were implemented directly in `Autobot_v1.mq5` (and mirrored into this plan's Task 15 code block above), recompiled and verified fresh via `.ex5`/`.mq5` mtime comparison (0 errors, 0 warnings), and committed.

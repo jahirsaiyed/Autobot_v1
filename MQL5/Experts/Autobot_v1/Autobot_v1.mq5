@@ -172,13 +172,22 @@ int OnInit()
       g_maxDrawdownTripped = InpClearMaxDrawdownBreaker ? false : loadedMaxDrawdownTripped;
 
       // Persist immediately whenever this branch changes what's on disk
-      // relative to what was loaded (day-rollover reset, or the override
-      // just cleared a trip) - otherwise the next restart reloads the
-      // stale file and silently undoes the change just made here (e.g.
-      // re-tripping a breaker the operator just cleared, since the file
-      // still says "tripped").
-      if(g_dailyBreakerTripped != loadedDailyBreakerTripped || g_maxDrawdownTripped != loadedMaxDrawdownTripped)
-         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+      // relative to what was loaded: day-rollover reset, the override
+      // clearing a trip, OR (found by independent review) a fresh
+      // dailyStartDayCode - without that last check, a SECOND restart
+      // later the same day would reload the still-stale (yesterday's)
+      // file, see loadedDayCode != today AGAIN, and silently re-derive a
+      // brand new "start of day" baseline from whatever equity exists at
+      // THAT restart - quietly moving the daily-loss breaker's reference
+      // point mid-day and potentially masking a real loss that happened
+      // between the two restarts.
+      if(g_dailyStartDayCode != loadedDayCode
+         || g_dailyBreakerTripped != loadedDailyBreakerTripped
+         || g_maxDrawdownTripped != loadedMaxDrawdownTripped)
+        {
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+            Print("Autobot_v1: WARNING - failed to persist state after OnInit restore. A second restart before the next successful save could re-derive a stale daily baseline or re-trip a manually-cleared breaker.");
+        }
      }
    else
      {
@@ -187,7 +196,8 @@ int OnInit()
       g_equityPeak          = nowEquity;
       g_dailyBreakerTripped = false;
       g_maxDrawdownTripped  = false;
-      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+      if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+         Print("Autobot_v1: WARNING - failed to persist state on genuine first run.");
      }
 
    ReconstructOpenPositionState();
@@ -294,15 +304,27 @@ void ManageOpenPosition(int idx)
          double newSL  = CalculateBreakevenSL(entryPrice, isLong, buffer);
          newSL = NormalizeAndClampStopLoss(symbol, newSL, isLong);
 
-         bool modified = g_trade.PositionModify(ticket, newSL, 0.0);
-         if(modified)
+         // Guard added after independent review: on a broker whose
+         // stops/freeze level is unusually large relative to this trade's
+         // initial risk, the clamp above can pull the intended breakeven
+         // SL back past the position's CURRENT (original entry) stop -
+         // i.e. it could silently loosen risk instead of locking in
+         // breakeven. Only modify if the clamped result still genuinely
+         // improves on the current SL; otherwise skip this tick and retry
+         // on the next one (mirrors the structure-trail branch below).
+         bool improves = isLong ? (newSL > currentSL) : (newSL < currentSL);
+         if(improves)
            {
-            g_symbolStates[idx].trailPhase = TRAIL_PHASE_2_STRUCTURE;
-            LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update", currentPrice, 0, newSL, currentEquity, "breakeven-move");
+            bool modified = g_trade.PositionModify(ticket, newSL, 0.0);
+            if(modified)
+              {
+               g_symbolStates[idx].trailPhase = TRAIL_PHASE_2_STRUCTURE;
+               LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update", currentPrice, 0, newSL, currentEquity, "breakeven-move");
+              }
+            else
+               LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update-failed", currentPrice, 0, newSL, currentEquity,
+                        StringFormat("breakeven-move-retcode-%u", g_trade.ResultRetcode()));
            }
-         else
-            LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update-failed", currentPrice, 0, newSL, currentEquity,
-                     StringFormat("breakeven-move-retcode-%u", g_trade.ResultRetcode()));
         }
       return;
      }
@@ -469,7 +491,10 @@ void OnTimer()
       // even after a human "fixes" the file and restarts. Leave the file
       // exactly as found until a human clears the fail-safe.
       if(!g_entriesBlockedPersistenceFailsafe)
-         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+        {
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+            Print("Autobot_v1: WARNING - failed to persist state on day rollover.");
+        }
      }
 
    bool wasDailyBreakerTripped = g_dailyBreakerTripped;
@@ -483,13 +508,23 @@ void OnTimer()
       // Make the trip durable immediately rather than waiting for the next
       // scheduled save point (day-rollover or peak-update).
       if(!g_entriesBlockedPersistenceFailsafe)
-         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+        {
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+           {
+            Print("Autobot_v1: WARNING - failed to persist DAILY LOSS breaker trip. Trip is active in memory but not yet durable on disk.");
+            SendAlert("Autobot_v1: WARNING - failed to persist the daily-loss circuit breaker trip to disk.",
+                      InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+           }
+        }
      }
 
    double previousPeak = g_equityPeak;
    g_equityPeak = UpdateEquityPeak(g_equityPeak, currentEquity);
    if(g_equityPeak != previousPeak && !g_entriesBlockedPersistenceFailsafe)
-      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+     {
+      if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+         Print("Autobot_v1: WARNING - failed to persist updated equity peak.");
+     }
 
    bool wasMaxDDTripped = g_maxDrawdownTripped;
    g_maxDrawdownTripped = g_maxDrawdownTripped || IsMaxDrawdownTripped(g_equityPeak, currentEquity, InpMaxDrawdownPercent);
@@ -502,7 +537,14 @@ void OnTimer()
       // Make the trip durable immediately rather than waiting for the next
       // scheduled save point.
       if(!g_entriesBlockedPersistenceFailsafe)
-         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+        {
+         if(!SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped))
+           {
+            Print("Autobot_v1: WARNING - failed to persist MAX DRAWDOWN breaker trip. Trip is active in memory but not yet durable on disk.");
+            SendAlert("Autobot_v1: WARNING - failed to persist the max-drawdown circuit breaker trip to disk.",
+                      InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+           }
+        }
      }
 
    bool newEntriesAllowed = !g_dailyBreakerTripped && !g_maxDrawdownTripped && !g_entriesBlockedPersistenceFailsafe;
