@@ -36,6 +36,12 @@ bool    g_maxDrawdownTripped;
 bool    g_entriesBlockedPersistenceFailsafe;
 datetime g_lastHeartbeat;
 
+// Risk committed to correlated-group (BTC/ETH) symbols earlier in the SAME
+// OnTimer pass but not yet visible via PositionsTotal()/PositionGetX (order
+// send + position materializing is not instantaneous). Reset at the top of
+// every OnTimer() call. See GetOtherCryptoOpenRiskPercent().
+double g_pendingCryptoRiskThisPass;
+
 long CurrentDayCode()
   {
    MqlDateTime dt;
@@ -76,6 +82,17 @@ void ReconstructOpenPositionState()
 
 int OnInit()
   {
+   // Demo-only guard: v1 is deliberately scoped to demo-account use per the
+   // design spec. The Strategy Tester and optimization passes are exempted
+   // since they aren't real accounts. This must be the first substantive
+   // check in OnInit, before any other setup.
+   if(!InpAllowLiveAccount && !MQLInfoInteger(MQL_TESTER) && !MQLInfoInteger(MQL_OPTIMIZATION)
+      && AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
+     {
+      Print("Autobot_v1: refusing to run on a non-demo account (v1 is demo-only per design spec). Set InpAllowLiveAccount=true to override.");
+      return(INIT_FAILED);
+     }
+
    GetSymbolConfigs(g_symbolConfigs);
    InitSymbolStates(g_symbolStates, g_symbolConfigs);
 
@@ -87,8 +104,10 @@ int OnInit()
 
    double loadedEquity, loadedPeak;
    long   loadedDayCode;
+   bool   loadedDailyBreakerTripped, loadedMaxDrawdownTripped;
    bool   fileValid;
-   bool   fileFound = LoadPersistedState(loadedEquity, loadedDayCode, loadedPeak, fileValid);
+   bool   fileFound = LoadPersistedState(loadedEquity, loadedDayCode, loadedPeak,
+                                          loadedDailyBreakerTripped, loadedMaxDrawdownTripped, fileValid);
 
    bool anyPriorDeals = false;
    if(HistorySelect(0, TimeCurrent()))
@@ -109,18 +128,24 @@ int OnInit()
    if(fileFound && !fileValid)
      {
       g_entriesBlockedPersistenceFailsafe = true;
-      g_dailyStartEquity  = nowEquity;
-      g_dailyStartDayCode = CurrentDayCode();
-      g_equityPeak        = nowEquity;
+      g_dailyStartEquity    = nowEquity;
+      g_dailyStartDayCode   = CurrentDayCode();
+      g_equityPeak          = nowEquity;
+      // We can't trust anything in this branch - stay maximally
+      // conservative on both breaker flags, not just max-drawdown.
+      g_dailyBreakerTripped = true;
+      g_maxDrawdownTripped  = true;
       SendAlert("Autobot_v1: persistence file corrupt on startup - new entries BLOCKED pending manual review.",
                 InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
      }
    else if(!fileFound && anyPriorDeals)
      {
       g_entriesBlockedPersistenceFailsafe = true;
-      g_dailyStartEquity  = nowEquity;
-      g_dailyStartDayCode = CurrentDayCode();
-      g_equityPeak        = nowEquity;
+      g_dailyStartEquity    = nowEquity;
+      g_dailyStartDayCode   = CurrentDayCode();
+      g_equityPeak          = nowEquity;
+      g_dailyBreakerTripped = true;
+      g_maxDrawdownTripped  = true;
       SendAlert("Autobot_v1: persistence file missing but trade history exists - new entries BLOCKED pending manual review.",
                 InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
      }
@@ -129,29 +154,37 @@ int OnInit()
       g_dailyStartEquity  = loadedEquity;
       g_dailyStartDayCode = loadedDayCode;
       g_equityPeak        = loadedPeak;
+
+      if(loadedDayCode != CurrentDayCode())
+        {
+         // A new day has started since the file was written - mirror
+         // OnTimer's day-rollover logic. Yesterday's daily trip must never
+         // carry into today.
+         g_dailyStartEquity    = nowEquity;
+         g_dailyStartDayCode   = CurrentDayCode();
+         g_dailyBreakerTripped = false;
+        }
+      else
+         g_dailyBreakerTripped = loadedDailyBreakerTripped;
+
+      // Sticky across restarts unless a human explicitly clears it via
+      // InpClearMaxDrawdownBreaker - a restart alone must never clear it.
+      g_maxDrawdownTripped = InpClearMaxDrawdownBreaker ? false : loadedMaxDrawdownTripped;
      }
    else
      {
-      g_dailyStartEquity  = nowEquity;
-      g_dailyStartDayCode = CurrentDayCode();
-      g_equityPeak        = nowEquity;
-      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak);
+      g_dailyStartEquity    = nowEquity;
+      g_dailyStartDayCode   = CurrentDayCode();
+      g_equityPeak          = nowEquity;
+      g_dailyBreakerTripped = false;
+      g_maxDrawdownTripped  = false;
+      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
      }
-
-   g_dailyBreakerTripped = false;
-   if(g_entriesBlockedPersistenceFailsafe)
-      // The in-memory equityPeak above was seeded from current equity, not
-      // the true historical peak (which is unknown - the file was corrupt
-      // or missing). Computing IsMaxDrawdownTripped against a fabricated
-      // peak would always report "not tripped". Stay conservative until a
-      // human clears the fail-safe.
-      g_maxDrawdownTripped = true;
-   else
-      g_maxDrawdownTripped = IsMaxDrawdownTripped(g_equityPeak, nowEquity, InpMaxDrawdownPercent);
 
    ReconstructOpenPositionState();
 
    g_lastHeartbeat = TimeCurrent();
+   g_pendingCryptoRiskThisPass = 0.0;
 
    if(!EventSetTimer(TIMER_INTERVAL_SECONDS))
      {
@@ -176,16 +209,54 @@ void OnTick()
    // The multi-symbol loop runs on OnTimer (see spec Architecture section).
   }
 
+// Fires on every deal (fill), including closes. Used only to log the
+// "exit" event for our own symbols/magics - entries are already logged in
+// ProcessSymbol at the point the order is sent.
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
+  {
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+   if(!HistoryDealSelect(trans.deal))
+      return;
+
+   ulong dealMagic = (ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+   bool isOurs = false;
+   for(int i = 0; i < ArraySize(g_symbolConfigs); i++)
+      if(dealMagic == g_symbolConfigs[i].magicNumber)
+         isOurs = true;
+   if(!isOurs)
+      return;
+
+   ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
+      return; // only closing deals - entries are already logged in ProcessSymbol
+
+   string symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+   double price  = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+   double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+   double volume = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+
+   LogEvent(TimeToString(TimeCurrent()), symbol, "exit", price, volume, 0.0, AccountInfoDouble(ACCOUNT_EQUITY),
+            StringFormat("profit=%.2f", profit));
+  }
+
+// Returns the larger of: (a) the OTHER correlated-group symbol's live open
+// risk (from an already-materialized position), or (b) risk committed to a
+// correlated-group symbol earlier in this SAME OnTimer pass whose position
+// may not have materialized in PositionsTotal() yet. Without (b), two
+// crypto signals firing in the same pass could both read "no other position
+// open" and both pass the cap check, exceeding InpCorrelatedCapPercent.
 double GetOtherCryptoOpenRiskPercent(int idx)
   {
+   double liveRisk = 0.0;
    for(int i = 0; i < ArraySize(g_symbolConfigs); i++)
      {
       if(i == idx || !g_symbolConfigs[i].isCorrelatedGroup)
          continue;
       if(SelectPositionBySymbolMagic(g_symbolConfigs[i].symbol, g_symbolConfigs[i].magicNumber))
-         return g_symbolStates[i].riskPercentAtEntry;
+         liveRisk = g_symbolStates[i].riskPercentAtEntry;
      }
-   return 0.0;
+   return MathMax(liveRisk, g_pendingCryptoRiskThisPass);
   }
 
 void ManageOpenPosition(int idx)
@@ -196,11 +267,12 @@ void ManageOpenPosition(int idx)
    if(!SelectPositionBySymbolMagic(symbol, magic))
       return;
 
-   ulong  ticket       = (ulong)PositionGetInteger(POSITION_TICKET);
-   bool   isLong       = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-   double entryPrice   = PositionGetDouble(POSITION_PRICE_OPEN);
-   double currentSL    = PositionGetDouble(POSITION_SL);
-   double currentPrice = isLong ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+   ulong  ticket        = (ulong)PositionGetInteger(POSITION_TICKET);
+   bool   isLong        = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+   double entryPrice    = PositionGetDouble(POSITION_PRICE_OPEN);
+   double currentSL     = PositionGetDouble(POSITION_SL);
+   double currentPrice  = isLong ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
 
    double unrealizedProfitPrice = isLong ? (currentPrice - entryPrice) : (entryPrice - currentPrice);
 
@@ -211,8 +283,17 @@ void ManageOpenPosition(int idx)
          double point  = SymbolInfoDouble(symbol, SYMBOL_POINT);
          double buffer = InpBreakevenBufferPoints * point;
          double newSL  = CalculateBreakevenSL(entryPrice, isLong, buffer);
-         if(g_trade.PositionModify(ticket, newSL, 0.0))
+         newSL = NormalizeAndClampStopLoss(symbol, newSL, isLong);
+
+         bool modified = g_trade.PositionModify(ticket, newSL, 0.0);
+         if(modified)
+           {
             g_symbolStates[idx].trailPhase = TRAIL_PHASE_2_STRUCTURE;
+            LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update", currentPrice, 0, newSL, currentEquity, "breakeven-move");
+           }
+         else
+            LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update-failed", currentPrice, 0, newSL, currentEquity,
+                     StringFormat("breakeven-move-retcode-%u", g_trade.ResultRetcode()));
         }
       return;
      }
@@ -220,10 +301,18 @@ void ManageOpenPosition(int idx)
    double priorBarLow  = iLow(symbol, PERIOD_H1, 1);
    double priorBarHigh = iHigh(symbol, PERIOD_H1, 1);
    double newTrailSL   = CalculateStructureTrailSL(priorBarLow, priorBarHigh, isLong);
+   newTrailSL = NormalizeAndClampStopLoss(symbol, newTrailSL, isLong);
 
    bool improves = isLong ? (newTrailSL > currentSL) : (newTrailSL < currentSL);
    if(improves)
-      g_trade.PositionModify(ticket, newTrailSL, 0.0);
+     {
+      bool modified = g_trade.PositionModify(ticket, newTrailSL, 0.0);
+      if(modified)
+         LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update", currentPrice, 0, newTrailSL, currentEquity, "structure-trail");
+      else
+         LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update-failed", currentPrice, 0, newTrailSL, currentEquity,
+                  StringFormat("structure-trail-retcode-%u", g_trade.ResultRetcode()));
+     }
   }
 
 void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
@@ -252,7 +341,10 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
 
    double h4Close, h4Ema, h4Atr;
    if(!ComputeH4Bias(symbol, g_emaHandles[idx], g_atrH4Handles[idx], h4Close, h4Ema, h4Atr))
+     {
+      LogEvent(TimeToString(TimeCurrent()), symbol, "signal-skipped-data-unavailable", 0, 0, 0, currentEquity, "compute-h4-bias-failed");
       return;
+     }
 
    ENUM_BIAS bias = DetermineBias(h4Close, h4Ema, h4Atr, InpDeadbandATRMultiplier);
    g_symbolStates[idx].bias = bias;
@@ -262,7 +354,10 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
    double h1Close = iClose(symbol, PERIOD_H1, 1);
    double priorHigh, priorLow;
    if(!ComputeDonchian(symbol, InpDonchianPeriod, priorHigh, priorLow))
+     {
+      LogEvent(TimeToString(TimeCurrent()), symbol, "signal-skipped-data-unavailable", 0, 0, 0, currentEquity, "compute-donchian-failed");
       return;
+     }
 
    ENUM_SIGNAL signal = DetectBreakout(h1Close, priorHigh, priorLow, bias);
    if(signal == SIGNAL_NONE)
@@ -270,7 +365,10 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
 
    double atrH1;
    if(!ComputeATRH1(g_atrH1Handles[idx], atrH1))
+     {
+      LogEvent(TimeToString(TimeCurrent()), symbol, "signal-skipped-data-unavailable", 0, 0, 0, currentEquity, "compute-atr-failed");
       return;
+     }
 
    bool   isLong      = (signal == SIGNAL_LONG_BREAKOUT);
    double entryPrice  = isLong ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
@@ -313,6 +411,8 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
       return;
      }
 
+   stopLoss = NormalizeAndClampStopLoss(symbol, stopLoss, isLong);
+
    string comment = "AutoBotV1|TrendBreak|H1";
    bool sent = ExecuteMarketOrder(g_trade, symbol, isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
                                    lots, stopLoss, magic, comment,
@@ -324,6 +424,8 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
       g_symbolStates[idx].initialStopDistance = stopDistance;
       g_symbolStates[idx].entryPrice          = entryPrice;
       g_symbolStates[idx].riskPercentAtEntry  = InpRiskPercent;
+      if(g_symbolConfigs[idx].isCorrelatedGroup)
+         g_pendingCryptoRiskThisPass += InpRiskPercent;
       LogEvent(TimeToString(TimeCurrent()), symbol, "entry", entryPrice, lots, stopLoss, currentEquity, comment);
      }
    else
@@ -344,6 +446,7 @@ void MaybeSendHeartbeat()
 void OnTimer()
   {
    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_pendingCryptoRiskThisPass = 0.0;
 
    long today = CurrentDayCode();
    if(today != g_dailyStartDayCode)
@@ -357,22 +460,41 @@ void OnTimer()
       // even after a human "fixes" the file and restarts. Leave the file
       // exactly as found until a human clears the fail-safe.
       if(!g_entriesBlockedPersistenceFailsafe)
-         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak);
+         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
      }
 
+   bool wasDailyBreakerTripped = g_dailyBreakerTripped;
    g_dailyBreakerTripped = UpdateDailyBreakerState(g_dailyBreakerTripped, g_dailyStartEquity, currentEquity, InpDailyLossPercent);
+   if(g_dailyBreakerTripped && !wasDailyBreakerTripped)
+     {
+      LogEvent(TimeToString(TimeCurrent()), "ACCOUNT", "circuit-breaker-tripped", 0, 0, 0, currentEquity, "daily-loss");
+      SendAlert(StringFormat("Autobot_v1: DAILY LOSS circuit breaker tripped. Start=%.2f Current=%.2f. New entries disabled for the rest of the day.",
+                             g_dailyStartEquity, currentEquity),
+                InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+      // Make the trip durable immediately rather than waiting for the next
+      // scheduled save point (day-rollover or peak-update).
+      if(!g_entriesBlockedPersistenceFailsafe)
+         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+     }
 
    double previousPeak = g_equityPeak;
    g_equityPeak = UpdateEquityPeak(g_equityPeak, currentEquity);
    if(g_equityPeak != previousPeak && !g_entriesBlockedPersistenceFailsafe)
-      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak);
+      SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
 
    bool wasMaxDDTripped = g_maxDrawdownTripped;
    g_maxDrawdownTripped = g_maxDrawdownTripped || IsMaxDrawdownTripped(g_equityPeak, currentEquity, InpMaxDrawdownPercent);
    if(g_maxDrawdownTripped && !wasMaxDDTripped)
+     {
+      LogEvent(TimeToString(TimeCurrent()), "ACCOUNT", "circuit-breaker-tripped", 0, 0, 0, currentEquity, "max-drawdown");
       SendAlert(StringFormat("Autobot_v1: MAX DRAWDOWN circuit breaker tripped. Peak=%.2f Current=%.2f. New entries disabled - manual re-enable required.",
                              g_equityPeak, currentEquity),
                 InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+      // Make the trip durable immediately rather than waiting for the next
+      // scheduled save point.
+      if(!g_entriesBlockedPersistenceFailsafe)
+         SavePersistedState(g_dailyStartEquity, g_dailyStartDayCode, g_equityPeak, g_dailyBreakerTripped, g_maxDrawdownTripped);
+     }
 
    bool newEntriesAllowed = !g_dailyBreakerTripped && !g_maxDrawdownTripped && !g_entriesBlockedPersistenceFailsafe;
 
