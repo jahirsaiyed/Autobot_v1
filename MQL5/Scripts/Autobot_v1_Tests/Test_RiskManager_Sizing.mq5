@@ -33,5 +33,15 @@ void OnStart()
    lots = CalculateLotSize(10000.0, 1.0, 0.0, 1.0, 1.0, 0.01, 0.01, 100.0, skipped);
    T_AssertTrue("zero stop distance is skipped", skipped);
 
+   // Case 5: fine volumeStep (0.001, common on some crypto CFDs) must
+   // preserve 3-decimal precision, not truncate to a hardcoded 2 decimals.
+   // equity=10000, risk=1% => riskAmount=100. tickValue=1, tickSize=1 =>
+   // valuePerLot=stopDistance=808. rawLots=100/808=0.123762... steps down
+   // to 0.123 at volumeStep=0.001 (NOT 0.12, which a hardcoded 2-decimal
+   // round would have produced).
+   lots = CalculateLotSize(10000.0, 1.0, 808.0, 1.0, 1.0, 0.001, 0.001, 100.0, skipped);
+   T_AssertTrue("fine volumeStep case not skipped", !skipped);
+   T_AssertEqualsDouble("fine volumeStep case preserves 3-decimal precision (0.123, not 0.12)", lots, 0.123);
+
    T_PrintSummary("Test_RiskManager_Sizing");
   }

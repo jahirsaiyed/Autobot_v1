@@ -39,7 +39,11 @@ double CalculateLotSize(double equity, double riskPercent, double stopDistancePr
    if(steppedLots > volumeMax)
       steppedLots = volumeMax;
 
-   return NormalizeDouble(steppedLots, 2);
+   // Round to the broker's actual volume-step precision, not a hardcoded 2
+   // decimals - a 0.001 volumeStep (common on some crypto CFDs) would
+   // otherwise have its third decimal silently truncated away here.
+   int volDigits = (int)MathMax(0, MathCeil(-MathLog10(volumeStep) - 0.0000001));
+   return NormalizeDouble(steppedLots, volDigits);
   }
 
 // --- Circuit breakers ---------------------------------------------------
