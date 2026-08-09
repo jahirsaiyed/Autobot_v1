@@ -3,6 +3,14 @@
 //+------------------------------------------------------------------+
 #property strict
 
+// Include guard: MQL5 has no #pragma once and no automatic double-include
+// protection. This header is included both directly (Autobot_v1.mq5) and
+// transitively (via SymbolState.mqh, used by several other modules), so
+// without this guard a multi-module compile unit fails with "already
+// defined" errors on every input/struct/function below.
+#ifndef AUTOBOT_V1_CONFIG_MQH
+#define AUTOBOT_V1_CONFIG_MQH
+
 input group "Risk Management"
 input double InpRiskPercent            = 1.0;   // Risk per trade (% of equity)
 input double InpDailyLossPercent       = 5.0;   // Daily loss circuit breaker (%)
@@ -67,3 +75,5 @@ void GetSymbolConfigs(SymbolConfig &configs[])
    configs[2].maxSpreadPoints   = InpMaxSpreadPointsCrypto;
    configs[2].slippagePoints    = InpSlippagePointsCrypto;
   }
+
+#endif // AUTOBOT_V1_CONFIG_MQH
