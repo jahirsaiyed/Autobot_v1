@@ -1558,25 +1558,37 @@ void OnStart()
      {
       bool   foundPosition = false;
       double actualSL      = 0.0;
-      ulong  positionTicket = 0;
 
-      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      // Brief retry in case of fill-reporting latency between trade.Buy()
+      // returning true and the position appearing in PositionsTotal().
+      for(int attempt = 0; attempt < 5 && !foundPosition; attempt++)
         {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket != 0 && PositionGetString(POSITION_SYMBOL) == TEST_SYMBOL && (ulong)PositionGetInteger(POSITION_MAGIC) == TEST_MAGIC)
+         for(int i = PositionsTotal() - 1; i >= 0; i--)
            {
-            foundPosition  = true;
-            actualSL       = PositionGetDouble(POSITION_SL);
-            positionTicket = ticket;
-            break;
+            ulong ticket = PositionGetTicket(i);
+            if(ticket != 0 && PositionGetString(POSITION_SYMBOL) == TEST_SYMBOL && (ulong)PositionGetInteger(POSITION_MAGIC) == TEST_MAGIC)
+              {
+               foundPosition = true;
+               actualSL      = PositionGetDouble(POSITION_SL);
+               break;
+              }
            }
+         if(!foundPosition)
+            Sleep(200);
         }
 
       T_AssertTrue("opened position found after ExecuteMarketOrder", foundPosition);
       T_AssertTrue("stop loss attached to the live position", actualSL > 0.0);
+     }
 
-      if(positionTicket != 0)
-         trade.PositionClose(positionTicket);
+   // Unconditional safety-net cleanup: close ANY position matching this
+   // test's symbol+magic, regardless of whether the search above found it,
+   // so a transient lookup miss can never leave a real position open.
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket != 0 && PositionGetString(POSITION_SYMBOL) == TEST_SYMBOL && (ulong)PositionGetInteger(POSITION_MAGIC) == TEST_MAGIC)
+         trade.PositionClose(ticket);
      }
 
    T_AssertTrue("no leftover ExecuteMarketOrder position after close", HasExistingPositionOrOrder(TEST_SYMBOL, TEST_MAGIC) == false);
