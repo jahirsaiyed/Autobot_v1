@@ -71,4 +71,18 @@ bool IsMaxDrawdownTripped(double equityPeak, double currentEquity, double maxDra
    return (currentEquity <= threshold);
   }
 
+// --- Correlated exposure cap (BTCUSD + ETHUSD) --------------------------
+
+// existingOtherSymbolRiskPercent is the OTHER crypto symbol's open risk
+// (0 if none open), fixed at its risk-at-entry value per the spec's
+// cap-basis decision (not recalculated as that trade trails).
+// newRiskPercent is the risk the incoming trade would take if opened.
+// The BTC-before-ETH tie-break is enforced structurally by main-loop
+// array order (Config.mqh, Task 2) - this function only checks the cap.
+bool CanOpenCryptoPosition(double existingOtherSymbolRiskPercent, double newRiskPercent, double capPercent)
+  {
+   double combined = existingOtherSymbolRiskPercent + newRiskPercent;
+   return (combined <= capPercent + 0.0000001); // epsilon guards float rounding at the exact boundary
+  }
+
 #endif // AUTOBOT_V1_RISKMANAGER_MQH
