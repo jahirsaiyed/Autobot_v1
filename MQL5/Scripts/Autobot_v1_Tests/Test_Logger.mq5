@@ -6,15 +6,17 @@ void OnStart()
   {
    T_ResetCounters();
 
-   if(FileIsExist(LogFileName(), FILE_COMMON))
-      FileDelete(LogFileName(), FILE_COMMON);
+   // testMode=true throughout - never touches the production
+   // Autobot_v1_log.csv file.
+   if(FileIsExist(LogFileName(true), FILE_COMMON))
+      FileDelete(LogFileName(true), FILE_COMMON);
 
    T_AssertTrue("first log event succeeds",
-                LogEvent("2026.08.09 12:00:00", "XAUUSD", "entry", 2000.12345, 0.10, 1990.0, 10000.0, "AutoBotV1|TrendBreak|H1"));
+                LogEvent("2026.08.09 12:00:00", "XAUUSD", "entry", 2000.12345, 0.10, 1990.0, 10000.0, "AutoBotV1|TrendBreak|H1", true));
    T_AssertTrue("second log event succeeds",
-                LogEvent("2026.08.09 13:00:00", "BTCUSD", "exit", 65000.5, 0.01, 64000.0, 10050.0, "trail-stop"));
+                LogEvent("2026.08.09 13:00:00", "BTCUSD", "exit", 65000.5, 0.01, 64000.0, 10050.0, "trail-stop", true));
 
-   int handle = FileOpen(LogFileName(), FILE_READ | FILE_CSV | FILE_COMMON, ',');
+   int handle = FileOpen(LogFileName(true), FILE_READ | FILE_CSV | FILE_COMMON, ',');
    T_AssertTrue("log file reopens for reading", handle != INVALID_HANDLE);
 
    string header = FileReadString(handle);
@@ -27,7 +29,7 @@ void OnStart()
    T_AssertEqualsString("row 1 symbol matches", row1Symbol, "XAUUSD");
 
    FileClose(handle);
-   FileDelete(LogFileName(), FILE_COMMON);
+   FileDelete(LogFileName(true), FILE_COMMON);
 
    T_PrintSummary("Test_Logger");
   }

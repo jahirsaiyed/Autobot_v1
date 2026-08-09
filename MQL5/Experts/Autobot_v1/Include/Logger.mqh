@@ -6,9 +6,11 @@
 #ifndef AUTOBOT_V1_LOGGER_MQH
 #define AUTOBOT_V1_LOGGER_MQH
 
-string LogFileName()
+// testMode=true is used exclusively by test scripts (Test_Logger.mq5) so
+// they never read/write the production log file.
+string LogFileName(bool testMode = false)
   {
-   return "Autobot_v1_log.csv";
+   return testMode ? "Autobot_v1_log.TEST.csv" : "Autobot_v1_log.csv";
   }
 
 // FILE_COMMON is shared machine-wide across every terminal install AND the
@@ -23,23 +25,23 @@ int LogFileFlag()
    return inTesterOrOptimization ? 0 : FILE_COMMON;
   }
 
-void EnsureLogHeader()
+void EnsureLogHeader(bool testMode = false)
   {
-   if(FileIsExist(LogFileName(), LogFileFlag()))
+   if(FileIsExist(LogFileName(testMode), LogFileFlag()))
       return;
 
-   int handle = FileOpen(LogFileName(), FILE_WRITE | FILE_CSV | LogFileFlag(), ',');
+   int handle = FileOpen(LogFileName(testMode), FILE_WRITE | FILE_CSV | LogFileFlag(), ',');
    if(handle == INVALID_HANDLE)
       return;
    FileWrite(handle, "timestamp", "symbol", "event_type", "price", "lots", "sl", "equity", "reason_tag");
    FileClose(handle);
   }
 
-bool LogEvent(string timestamp, string symbol, string eventType, double price, double lots, double sl, double equity, string reasonTag)
+bool LogEvent(string timestamp, string symbol, string eventType, double price, double lots, double sl, double equity, string reasonTag, bool testMode = false)
   {
-   EnsureLogHeader();
+   EnsureLogHeader(testMode);
 
-   int handle = FileOpen(LogFileName(), FILE_READ | FILE_WRITE | FILE_CSV | LogFileFlag(), ',');
+   int handle = FileOpen(LogFileName(testMode), FILE_READ | FILE_WRITE | FILE_CSV | LogFileFlag(), ',');
    if(handle == INVALID_HANDLE)
       return false;
 
