@@ -375,6 +375,12 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
 
    ManageOpenPosition(idx);
 
+   // Disabled symbols still get their open positions managed above (so
+   // toggling a symbol off never strands an existing trade without its
+   // breakeven/trailing logic) but are excluded from all new-entry
+   // evaluation below.
+   if(!g_symbolConfigs[idx].enabled)
+      return;
    if(!newEntriesAllowed)
       return;
    if(HasExistingPositionOrOrder(symbol, magic))

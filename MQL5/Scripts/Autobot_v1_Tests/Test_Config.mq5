@@ -19,6 +19,9 @@ void OnStart()
    T_AssertEqualsInt("XAUUSD magic = base+1", (int)configs[0].magicNumber, (int)InpMagicBase + 1);
    T_AssertEqualsInt("BTCUSD magic = base+2", (int)configs[1].magicNumber, (int)InpMagicBase + 2);
    T_AssertEqualsInt("ETHUSD magic = base+3", (int)configs[2].magicNumber, (int)InpMagicBase + 3);
+   T_AssertTrue("XAUUSD enabled reflects InpTradeXAUUSD", configs[0].enabled == InpTradeXAUUSD);
+   T_AssertTrue("BTCUSD enabled reflects InpTradeBTCUSD", configs[1].enabled == InpTradeBTCUSD);
+   T_AssertTrue("ETHUSD enabled reflects InpTradeETHUSD", configs[2].enabled == InpTradeETHUSD);
    // BTC-before-ETH tie-break is enforced by this array's index order (1
    // before 2), consumed by the main loop in Task 15 - not re-checked here.
 

@@ -41,6 +41,11 @@ input string InpTelegramBotToken       = "";     // Telegram bot token (never ha
 input string InpTelegramChatID         = "";     // Telegram chat ID
 input int    InpHeartbeatHours         = 24;     // Heartbeat notification interval, hours
 
+input group "Symbol Selection"
+input bool   InpTradeXAUUSD            = true;   // Allow new entries on XAUUSD
+input bool   InpTradeBTCUSD            = true;   // Allow new entries on BTCUSD
+input bool   InpTradeETHUSD            = true;   // Allow new entries on ETHUSD
+
 // Symbol configuration: one entry per traded symbol. Array order matters -
 // BTCUSD (index 1) is always evaluated before ETHUSD (index 2) in the main
 // loop, which is how the spec's fixed BTC-before-ETH tie-break is enforced.
@@ -51,6 +56,7 @@ struct SymbolConfig
    bool              isCorrelatedGroup; // true for BTCUSD/ETHUSD
    double            maxSpreadPoints;
    int               slippagePoints;
+   bool              enabled; // false = no new entries; existing positions still managed
   };
 
 #define AUTOBOT_SYMBOL_COUNT 3
@@ -64,18 +70,21 @@ void GetSymbolConfigs(SymbolConfig &configs[])
    configs[0].isCorrelatedGroup = false;
    configs[0].maxSpreadPoints   = InpMaxSpreadPointsGold;
    configs[0].slippagePoints    = InpSlippagePointsGold;
+   configs[0].enabled           = InpTradeXAUUSD;
 
    configs[1].symbol            = "BTCUSD";
    configs[1].magicNumber       = (ulong)InpMagicBase + 2;
    configs[1].isCorrelatedGroup = true;
    configs[1].maxSpreadPoints   = InpMaxSpreadPointsCrypto;
    configs[1].slippagePoints    = InpSlippagePointsCrypto;
+   configs[1].enabled           = InpTradeBTCUSD;
 
    configs[2].symbol            = "ETHUSD";
    configs[2].magicNumber       = (ulong)InpMagicBase + 3;
    configs[2].isCorrelatedGroup = true;
    configs[2].maxSpreadPoints   = InpMaxSpreadPointsCrypto;
    configs[2].slippagePoints    = InpSlippagePointsCrypto;
+   configs[2].enabled           = InpTradeETHUSD;
   }
 
 #endif // AUTOBOT_V1_CONFIG_MQH

@@ -342,7 +342,7 @@ Expected: `0 errors`.
 
 - [ ] **Step 4: Manual run**
 
-Run `Test_Config` in the terminal (Scripts panel). Expected Experts-tab output: 10 `PASS:` lines, `0 failed`, `ALL TESTS PASSED: Test_Config`.
+Run `Test_Config` in the terminal (Scripts panel). Expected Experts-tab output: 13 `PASS:` lines, `0 failed`, `ALL TESTS PASSED: Test_Config`. (Bumped from 10 to 13 by the post-merge Symbol Selection feature - see "Post-merge: per-symbol enable/disable" below.)
 
 - [ ] **Step 5: Commit**
 
@@ -2596,3 +2596,15 @@ Both fixes recompiled clean (0 errors, 0 warnings) individually and as the full 
   - `OnInit` (~135 lines) and `ProcessSymbol` (~118 lines) exceed this project's 50-line function guideline; the four `SavePersistedState` failure-handling blocks in `OnTimer` duplicate the same `Print`+`SendAlert`/`QueueAlert` pattern and could be extracted into a shared helper.
   - `SymbolState.entryPrice` is written but never read anywhere.
   - Day-rollover clears `g_dailyBreakerTripped` even while the persistence fail-safe is active - cosmetically inconsistent (the flag says "not tripped" while entries remain blocked by the fail-safe) but not functionally harmful, since the fail-safe's own block takes precedence.
+
+### Post-merge: per-symbol enable/disable (requested during demo monitoring)
+
+Requested while monitoring the merged EA running on demo, to allow disabling new entries on one symbol (e.g. XAUUSD, BTCUSD, or ETHUSD) without stopping the whole EA or detaching it from its chart.
+
+**Files touched:** `Include/Config.mqh`, `Autobot_v1.mq5`, `Scripts/Autobot_v1_Tests/Test_Config.mq5`.
+
+- Three new inputs in a new "Symbol Selection" group: `InpTradeXAUUSD`, `InpTradeBTCUSD`, `InpTradeETHUSD` (each `bool`, default `true`).
+- `SymbolConfig` gained a new `enabled` field, populated from the corresponding input in `GetSymbolConfigs()`.
+- `ProcessSymbol` gates on `g_symbolConfigs[idx].enabled` immediately after `ManageOpenPosition(idx)` but before `newEntriesAllowed`/`HasExistingPositionOrOrder`/all signal evaluation - so a disabled symbol still gets any already-open position's breakeven/trailing-stop logic serviced (never stranded without stop management), but is fully excluded from spread checks, bias/Donchian/ATR computation, and new entries.
+- `Test_Config.mq5` gained three new assertions confirming each `configs[i].enabled` reflects its corresponding input exactly (bumping the expected PASS count from 10 to 13 - see Task 2's manual-run step above).
+- **Verified:** compile-check 0 errors/0 warnings on `Test_Config.mq5` and the full `Autobot_v1.mq5`. Not yet re-run in the live terminal as of this writing - since this changes the running EA's inputs, it only takes effect once the operator re-attaches/reloads `Autobot_v1` on its chart.
