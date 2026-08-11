@@ -32,7 +32,8 @@ input int    InpMaxRetries             = 3;      // Max order-send retries on tr
 input int    InpSlippagePointsGold     = 50;     // Max deviation, XAUUSD
 input int    InpSlippagePointsCrypto   = 200;    // Max deviation, BTCUSD/ETHUSD
 input double InpMaxSpreadPointsGold    = 50;     // Spread guard, XAUUSD
-input double InpMaxSpreadPointsCrypto  = 300;    // Spread guard, BTCUSD/ETHUSD
+input double InpMaxSpreadPointsBTC     = 3500;   // Spread guard, BTCUSD (BTC's price scale runs far above ETH's, so it needs its own cap - see InpMaxSpreadPointsETH)
+input double InpMaxSpreadPointsETH     = 300;    // Spread guard, ETHUSD
 input bool   InpAllowLiveAccount       = false;  // Explicitly permit non-demo trading (v1 is demo-only by design)
 
 input group "Alerting"
@@ -75,14 +76,14 @@ void GetSymbolConfigs(SymbolConfig &configs[])
    configs[1].symbol            = "BTCUSD";
    configs[1].magicNumber       = (ulong)InpMagicBase + 2;
    configs[1].isCorrelatedGroup = true;
-   configs[1].maxSpreadPoints   = InpMaxSpreadPointsCrypto;
+   configs[1].maxSpreadPoints   = InpMaxSpreadPointsBTC;
    configs[1].slippagePoints    = InpSlippagePointsCrypto;
    configs[1].enabled           = InpTradeBTCUSD;
 
    configs[2].symbol            = "ETHUSD";
    configs[2].magicNumber       = (ulong)InpMagicBase + 3;
    configs[2].isCorrelatedGroup = true;
-   configs[2].maxSpreadPoints   = InpMaxSpreadPointsCrypto;
+   configs[2].maxSpreadPoints   = InpMaxSpreadPointsETH;
    configs[2].slippagePoints    = InpSlippagePointsCrypto;
    configs[2].enabled           = InpTradeETHUSD;
   }
