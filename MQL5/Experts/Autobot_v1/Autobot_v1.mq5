@@ -118,8 +118,24 @@ int OnInit()
    GetSymbolConfigs(g_symbolConfigs);
    InitSymbolStates(g_symbolStates, g_symbolConfigs);
 
+   // A symbol configured here (BTCUSD/ETHUSD in particular) may not exist
+   // on every broker/server - e.g. MQL5 Market's own validation/testing
+   // environment doesn't carry crypto symbols. Disable it for this session
+   // rather than failing OnInit (and the whole EA) over one missing symbol;
+   // existing positions on other symbols are unaffected. The existence
+   // check happens BEFORE SymbolSelect - calling SymbolSelect directly on a
+   // name the broker doesn't carry at all logs "symbol XXXX does not
+   // exist" to the Journal, which the Market's automated validator flags
+   // as an error even though OnInit already handles it gracefully.
    for(int i = 0; i < ArraySize(g_symbolConfigs); i++)
-      SymbolSelect(g_symbolConfigs[i].symbol, true);
+     {
+      if(!SymbolIsKnownToTerminal(g_symbolConfigs[i].symbol) || !SymbolSelect(g_symbolConfigs[i].symbol, true))
+        {
+         PrintFormat("Autobot_v1: symbol %s not available on this broker - disabling for this session.",
+                     g_symbolConfigs[i].symbol);
+         g_symbolConfigs[i].enabled = false;
+        }
+     }
 
    if(!CreateIndicatorHandles(g_symbolConfigs, g_emaHandles, g_atrH4Handles, g_atrH1Handles, InpEMAPeriod, InpATRPeriod))
       return(INIT_FAILED);

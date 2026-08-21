@@ -1,3 +1,6 @@
 # MQL5 compiled binaries and compiler logs
 *.ex5
 compile.log
+/.agents
+/.claude
+*.png

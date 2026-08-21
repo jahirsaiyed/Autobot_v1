@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "mql-developer": {
+      "source": "thomaspraun/mql-developer",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "81320224b55925599526af771ceeef6c0cc0ee7f7bc3c99c01d8c73e42f01545"
+    },
+    "mt5-trading": {
+      "source": "epinvest516-web/openclaw-skills",
+      "sourceType": "github",
+      "skillPath": "mt5-trading/SKILL.md",
+      "computedHash": "a3b67187afc0d7120f1584fc9e02e75a1dd5087adcbf8b07cd4ee570ec8b50cd"
+    }
+  }
+}

@@ -9,6 +9,24 @@
 #ifndef AUTOBOT_V1_MARKETDATA_MQH
 #define AUTOBOT_V1_MARKETDATA_MQH
 
+// Checks the terminal's full symbol list (not just Market Watch) BEFORE
+// calling SymbolSelect(). Calling SymbolSelect (or iMA/iATR/SymbolInfoXxx)
+// directly with a name the broker doesn't carry at all makes the terminal
+// itself log "symbol XXXX does not exist" to the Journal - which MQL5
+// Market's automated validator counts as an error even when OnInit handles
+// the false return gracefully. Enumerating known names first avoids ever
+// passing an unknown name into a resolving call, so that line is never
+// emitted for a genuinely-missing symbol like BTCUSD/ETHUSD on a broker
+// that doesn't list them.
+bool SymbolIsKnownToTerminal(const string symbol)
+  {
+   int total = SymbolsTotal(false);
+   for(int i = 0; i < total; i++)
+      if(SymbolName(i, false) == symbol)
+         return true;
+   return false;
+  }
+
 bool CreateIndicatorHandles(const SymbolConfig &configs[], int &emaHandles[], int &atrH4Handles[], int &atrH1Handles[],
                              int emaPeriod, int atrPeriod)
   {
@@ -19,6 +37,19 @@ bool CreateIndicatorHandles(const SymbolConfig &configs[], int &emaHandles[], in
 
    for(int i = 0; i < n; i++)
      {
+      // Disabled symbols (manually via input, or because SymbolSelect
+      // couldn't find them on this broker - see OnInit) never reach
+      // ComputeH4Bias/ComputeATRH1, so skip handle creation for them
+      // entirely rather than letting a missing symbol's indicator-load
+      // failure fail OnInit for the whole EA.
+      if(!configs[i].enabled)
+        {
+         emaHandles[i]   = INVALID_HANDLE;
+         atrH4Handles[i] = INVALID_HANDLE;
+         atrH1Handles[i] = INVALID_HANDLE;
+         continue;
+        }
+
       emaHandles[i]   = iMA(configs[i].symbol, PERIOD_H4, emaPeriod, 0, MODE_EMA, PRICE_CLOSE);
       atrH4Handles[i] = iATR(configs[i].symbol, PERIOD_H4, atrPeriod);
       atrH1Handles[i] = iATR(configs[i].symbol, PERIOD_H1, atrPeriod);
