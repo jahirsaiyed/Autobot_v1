@@ -295,6 +295,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 
    LogEvent(TimeToString(TimeCurrent()), symbol, "exit", price, volume, 0.0, AccountInfoDouble(ACCOUNT_EQUITY),
             StringFormat("profit=%.2f", profit));
+   SendAlert(StringFormat("Autobot_v1: position closed %s @ %.5f  profit=%.2f",
+                          symbol, price, profit),
+             InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
   }
 
 // Returns the larger of: (a) the OTHER correlated-group symbol's live open
@@ -358,10 +361,14 @@ void ManageOpenPosition(int idx)
               {
                g_symbolStates[idx].trailPhase = TRAIL_PHASE_2_STRUCTURE;
                LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update", currentPrice, 0, newSL, currentEquity, "breakeven-move");
+               QueueAlert(StringFormat("Autobot_v1: SL moved to breakeven %s  newSL=%.5f", symbol, newSL));
               }
             else
+              {
                LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update-failed", currentPrice, 0, newSL, currentEquity,
                         StringFormat("breakeven-move-retcode-%u", g_trade.ResultRetcode()));
+               QueueAlert(StringFormat("Autobot_v1: breakeven SL move FAILED on %s  retcode=%u", symbol, g_trade.ResultRetcode()));
+              }
            }
         }
       return;
@@ -377,10 +384,16 @@ void ManageOpenPosition(int idx)
      {
       bool modified = g_trade.PositionModify(ticket, newTrailSL, 0.0);
       if(modified)
+        {
          LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update", currentPrice, 0, newTrailSL, currentEquity, "structure-trail");
+         QueueAlert(StringFormat("Autobot_v1: SL trailed %s  newSL=%.5f", symbol, newTrailSL));
+        }
       else
+        {
          LogEvent(TimeToString(TimeCurrent()), symbol, "trail-update-failed", currentPrice, 0, newTrailSL, currentEquity,
                   StringFormat("structure-trail-retcode-%u", g_trade.ResultRetcode()));
+         QueueAlert(StringFormat("Autobot_v1: structure trail SL FAILED on %s  retcode=%u", symbol, g_trade.ResultRetcode()));
+        }
      }
   }
 
@@ -483,6 +496,7 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
    if(skipped)
      {
       LogEvent(TimeToString(TimeCurrent()), symbol, "entry-skipped-min-lot", entryPrice, 0, stopLoss, currentEquity, "sizing-below-minimum");
+      QueueAlert(StringFormat("Autobot_v1: entry skipped %s - lot size below minimum", symbol));
       return;
      }
 
@@ -490,11 +504,13 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
    if(!OrderCalcMargin(isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, symbol, lots, entryPrice, marginRequired))
      {
       LogEvent(TimeToString(TimeCurrent()), symbol, "entry-skipped-margin-calc-failed", entryPrice, lots, stopLoss, currentEquity, "order-calc-margin-failed");
+      QueueAlert(StringFormat("Autobot_v1: entry skipped %s - margin calculation failed", symbol));
       return;
      }
    if(marginRequired > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
      {
       LogEvent(TimeToString(TimeCurrent()), symbol, "entry-skipped-margin", entryPrice, lots, stopLoss, currentEquity, "insufficient-margin");
+      QueueAlert(StringFormat("Autobot_v1: entry skipped %s - insufficient margin", symbol));
       return;
      }
 
@@ -512,6 +528,8 @@ void ProcessSymbol(int idx, bool newEntriesAllowed, double currentEquity)
       if(g_symbolConfigs[idx].isCorrelatedGroup)
          g_pendingCryptoRiskThisPass += InpRiskPercent;
       LogEvent(TimeToString(TimeCurrent()), symbol, "entry", entryPrice, lots, stopLoss, currentEquity, comment);
+      QueueAlert(StringFormat("Autobot_v1: order opened %s %s @ %.5f  SL=%.5f  lots=%.2f",
+                              symbol, isLong ? "BUY" : "SELL", entryPrice, stopLoss, lots));
      }
    else
      {
@@ -536,6 +554,19 @@ void OnTimer()
    long today = CurrentDayCode();
    if(today != g_dailyStartDayCode)
      {
+      double prevStartEquity = g_dailyStartEquity;
+      double dailyPnL        = currentEquity - prevStartEquity;
+      double dailyPnLPct     = (prevStartEquity > 0) ? (dailyPnL / prevStartEquity * 100.0) : 0.0;
+      QueueAlert(StringFormat(
+         "Autobot_v1: Daily P&L Statement\n"
+         "Start equity : %.2f\n"
+         "End equity   : %.2f\n"
+         "P&L          : %.2f (%.2f%%)\n"
+         "Breaker      : %s",
+         prevStartEquity, currentEquity,
+         dailyPnL, dailyPnLPct,
+         g_dailyBreakerTripped ? "TRIPPED" : "OK"));
+
       g_dailyStartDayCode   = today;
       g_dailyStartEquity    = currentEquity;
       g_dailyBreakerTripped = false;

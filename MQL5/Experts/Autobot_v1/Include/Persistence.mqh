@@ -16,9 +16,20 @@
 
 // testMode=true is used exclusively by test scripts (Test_Persistence.mq5)
 // so they never read/write the production state file.
+//
+// The production filename is scoped by ACCOUNT_LOGIN. Without this, switching
+// the SAME terminal from a demo login to a real login (or vice versa) reads
+// and writes the other account's equityPeak/dailyStartEquity baseline -
+// which, since UpdateEquityPeak() never decreases, can make an unrelated
+// account's balance look like a >15% drawdown from a stale demo peak and
+// permanently trip the max-drawdown breaker the moment the account switch
+// happens. Scoping per-login gives each account its own file, so a switch
+// is always treated as that account's genuine first run.
 string PersistenceFileName(bool testMode = false)
   {
-   return testMode ? "Autobot_v1_state.TEST.bin" : "Autobot_v1_state.bin";
+   if(testMode)
+      return "Autobot_v1_state.TEST.bin";
+   return "Autobot_v1_state_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ".bin";
   }
 
 // Persistence is intentionally skipped ENTIRELY inside the Strategy Tester
