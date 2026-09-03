@@ -115,6 +115,21 @@ int OnInit()
       return(INIT_FAILED);
      }
 
+   // AutoTrading warning: MQL_TRADE_ALLOWED reflects both the toolbar
+   // AutoTrading button and this EA's own "Allow Algo Trading" property.
+   // When either is off, valid signals are still detected but every order
+   // send fails with retcode 10027 (TRADE_RETCODE_CLIENT_DISABLES_AT) - this
+   // has repeatedly gone unnoticed across a full trading day after a
+   // terminal/EA restart left it disabled. Warn immediately rather than
+   // relying on someone reading the Journal. Not fatal - AutoTrading can be
+   // enabled after this EA is already running, so init still proceeds.
+   if(!(bool)MQLInfoInteger(MQL_TRADE_ALLOWED) && !MQLInfoInteger(MQL_TESTER) && !MQLInfoInteger(MQL_OPTIMIZATION))
+     {
+      Print("Autobot_v1: WARNING - AutoTrading is disabled at startup. Signals will still be detected but every order will fail with retcode 10027 until it is enabled.");
+      SendAlert("Autobot_v1: WARNING - AutoTrading is DISABLED on startup. Orders will fail (retcode 10027) until you enable the AutoTrading button and this EA's 'Allow Algo Trading' property.",
+                InpEnableTelegram, InpTelegramBotToken, InpTelegramChatID);
+     }
+
    GetSymbolConfigs(g_symbolConfigs);
    InitSymbolStates(g_symbolStates, g_symbolConfigs);
 
